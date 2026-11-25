@@ -1,21 +1,31 @@
 <script lang="ts">
   import { FIRST_LEG_OPTIONS, isCarFirst, LAST_LEG_OPTIONS, TRANSIT_OPTIONS } from '../lib/modes';
-  import type { TransitChoice, TripSettings } from '../lib/types';
+  import type { FirstLeg, LastLeg, TransitChoice, TripSettings } from '../lib/types';
 
   let { settings = $bindable() }: { settings: TripSettings } = $props();
 
-  function toggleTransit(id: TransitChoice) {
-    settings.transit = settings.transit.includes(id)
-      ? settings.transit.filter((t) => t !== id)
-      : [...settings.transit, id];
+  /** Toggle `id` in `list`, but never leave the list empty. */
+  function toggled<T>(list: T[], id: T): T[] {
+    if (!list.includes(id)) return [...list, id];
+    return list.length > 1 ? list.filter((x) => x !== id) : list;
   }
+
+  const anyCar = $derived(settings.firstLegs.some(isCarFirst));
+  const onlyCar = $derived(settings.firstLegs.every(isCarFirst));
+  const anyRideshare = $derived(settings.firstLegs.includes('RIDESHARE') || settings.lastLegs.includes('RIDESHARE'));
+  const onlyRideshareLast = $derived(settings.lastLegs.length === 1 && settings.lastLegs[0] === 'RIDESHARE');
 </script>
 
 <fieldset>
-  <legend>1 · Get to transit</legend>
+  <legend>1 · Get to transit <span class="hint">pick one or more</span></legend>
   <div class="chips">
     {#each FIRST_LEG_OPTIONS as opt (opt.id)}
-      <button type="button" class="chip" aria-pressed={settings.firstLeg === opt.id} onclick={() => (settings.firstLeg = opt.id)}>
+      <button
+        type="button"
+        class="chip"
+        aria-pressed={settings.firstLegs.includes(opt.id)}
+        onclick={() => (settings.firstLegs = toggled<FirstLeg>(settings.firstLegs, opt.id))}
+      >
         {opt.icon} {opt.label}
       </button>
     {/each}
@@ -26,7 +36,12 @@
   <legend>2 · Transit</legend>
   <div class="chips">
     {#each TRANSIT_OPTIONS as opt (opt.id)}
-      <button type="button" class="chip" aria-pressed={settings.transit.includes(opt.id)} onclick={() => toggleTransit(opt.id)}>
+      <button
+        type="button"
+        class="chip"
+        aria-pressed={settings.transit.includes(opt.id)}
+        onclick={() => (settings.transit = toggled<TransitChoice>(settings.transit, opt.id))}
+      >
         {opt.icon} {opt.label}
       </button>
     {/each}
@@ -34,10 +49,15 @@
 </fieldset>
 
 <fieldset>
-  <legend>3 · From transit</legend>
+  <legend>3 · From transit <span class="hint">pick one or more</span></legend>
   <div class="chips">
     {#each LAST_LEG_OPTIONS as opt (opt.id)}
-      <button type="button" class="chip" aria-pressed={settings.lastLeg === opt.id} onclick={() => (settings.lastLeg = opt.id)}>
+      <button
+        type="button"
+        class="chip"
+        aria-pressed={settings.lastLegs.includes(opt.id)}
+        onclick={() => (settings.lastLegs = toggled<LastLeg>(settings.lastLegs, opt.id))}
+      >
         {opt.icon} {opt.label}
       </button>
     {/each}
@@ -47,26 +67,26 @@
 <details class="limits">
   <summary>Limits</summary>
   <label>
-    <span>Max {isCarFirst(settings.firstLeg) ? 'drive' : 'first leg'}: {settings.maxFirstLegMin} min</span>
+    <span>Max {onlyCar ? 'drive' : 'first leg'}: {settings.maxFirstLegMin} min</span>
     <input type="range" min="5" max="60" step="5" bind:value={settings.maxFirstLegMin} />
   </label>
   <label>
-    <span>Max {settings.lastLeg === 'RIDESHARE' ? 'rideshare' : 'last leg'}: {settings.maxLastLegMin} min</span>
+    <span>Max {onlyRideshareLast ? 'rideshare' : 'last leg'}: {settings.maxLastLegMin} min</span>
     <input type="range" min="5" max="45" step="5" bind:value={settings.maxLastLegMin} />
   </label>
-  {#if settings.firstLeg === 'RIDESHARE' || settings.lastLeg === 'RIDESHARE'}
+  {#if anyRideshare}
     <label>
       <span>Rideshare pickup wait: {settings.rideshareWaitMin} min</span>
       <input type="range" min="0" max="20" step="1" bind:value={settings.rideshareWaitMin} />
     </label>
   {/if}
-  {#if isCarFirst(settings.firstLeg)}
-    {#if settings.firstLeg === 'CAR_PARKING'}
-      <label>
-        <span>Parking + walk to platform: {settings.parkBufferMin} min</span>
-        <input type="range" min="0" max="20" step="1" bind:value={settings.parkBufferMin} />
-      </label>
-    {/if}
+  {#if settings.firstLegs.includes('CAR_PARKING')}
+    <label>
+      <span>Parking + walk to platform: {settings.parkBufferMin} min</span>
+      <input type="range" min="0" max="20" step="1" bind:value={settings.parkBufferMin} />
+    </label>
+  {/if}
+  {#if anyCar}
     <label>
       <span>Stations to compare: {settings.stationsToCompare}</span>
       <input type="range" min="2" max="10" step="1" bind:value={settings.stationsToCompare} />
@@ -86,6 +106,9 @@
     font-size: 0.75rem;
     font-weight: 600;
     color: var(--muted);
+  }
+  .hint {
+    font-weight: 400;
   }
   .chips {
     display: flex;

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   withinLimit,
+  buildParkAndRideshareOption,
   buildParkRideOption,
+  estimateCost,
   displayLegs,
   firstLegBufferSec,
   discoveryCandidates,
@@ -11,7 +13,7 @@ import {
   pickCandidates,
   scoreStation,
 } from '../src/lib/planner';
-import type { MotisItinerary, MotisLeg, MotisPlace, PlanResponse, TripRequest } from '../src/lib/types';
+import type { LegCombo, MotisItinerary, MotisLeg, MotisPlace, PlanResponse, TripSettings } from '../src/lib/types';
 
 const torrance = { lat: 33.8358, lon: -118.3406, name: 'Home' };
 const santaMonica = { lat: 34.0195, lon: -118.4912, name: 'Work' };
@@ -34,14 +36,16 @@ const place = (name: string, p: { lat: number; lon: number }, extra: Partial<Mot
   ...extra,
 });
 
-const request: TripRequest = {
+const request: LegCombo = {
   from: torrance,
   to: santaMonica,
   time: new Date('2026-12-01T16:00:00Z'),
   arriveBy: false,
   firstLeg: 'CAR_PARKING',
+  firstLegs: ['CAR_PARKING'],
   transit: ['LIGHT_RAIL'],
   lastLeg: 'WALK',
+  lastLegs: ['WALK'],
   maxFirstLegMin: 30,
   maxLastLegMin: 15,
   parkBufferMin: 5,
@@ -287,7 +291,7 @@ describe('rideshare', () => {
           endTime: '2026-12-01T17:27:00Z',
         }),
       ],
-      { ...request, lastLeg: 'RIDESHARE' },
+      { ...request, lastLegs: ['RIDESHARE'] },
       lastMile,
     );
     expect(legs.map((l) => [l.mode, l.durationSec])).toEqual([
@@ -317,5 +321,61 @@ describe('withinLimit', () => {
 
   it('falls back to the shortest drives when none fit', () => {
     expect(withinLimit([d(4000), d(2400), d(3000)], 1800, 2)).toEqual({ keep: [1, 2], relaxed: true });
+  });
+});
+
+describe('estimateCost', () => {
+  const base: TripSettings = {
+    firstLegs: ['CAR_PARKING'],
+    transit: ['LIGHT_RAIL'],
+    lastLegs: ['WALK'],
+    maxFirstLegMin: 30,
+    maxLastLegMin: 15,
+    parkBufferMin: 5,
+    rideshareWaitMin: 6,
+    stationsToCompare: 6,
+  };
+
+  it('matches a plain park-and-ride search', () => {
+    // discovery + 6 stations; 6 station drives + drive the whole way
+    expect(estimateCost(base, true)).toEqual({ tomtom: 7, transitous: 7 });
+    expect(estimateCost(base, false)).toEqual({ tomtom: 0, transitous: 7 });
+  });
+
+  it('grows with each first/last combination', () => {
+    const cost = estimateCost({ ...base, firstLegs: ['CAR_PARKING', 'BIKE'], lastLegs: ['WALK', 'RIDESHARE'] }, true);
+    // Transitous: 1 discovery + 1 car mode x 2 last legs x 6 stations + 1 street mode x 2 last legs
+    // TomTom: 6 + 1, then 4 rideshare stations, then 4 park-and-rideshare drives
+    expect(cost).toEqual({ tomtom: 15, transitous: 15 });
+  });
+});
+
+describe('buildParkAndRideshareOption', () => {
+  it('chains drive, parking, pickup wait and ride with no transit', () => {
+    const hub = {
+      key: 'bundy',
+      stopId: 'bundy',
+      name: 'Expo / Bundy Station',
+      station: { lat: 34.0315, lon: -118.4529 },
+      park: { lat: 34.0315, lon: -118.4529 },
+      walkSec: 0,
+      source: 'nearby' as const,
+      estimateSec: 2000,
+    };
+    const d = (seconds: number) => ({ seconds, delaySec: 0, distanceM: 1000, coords: [] as [number, number][], estimated: false });
+    const option = buildParkAndRideshareOption(request, hub, d(1800), d(600));
+    expect(option.title).toBe('Park at Expo / Bundy Station, rideshare the rest');
+    expect(option.transfers).toBe(0);
+    expect(option.legs.map((l) => [l.mode, l.durationSec])).toEqual([
+      ['CAR', 1800],
+      ['PARK', 5 * 60 + 60],
+      ['WAIT', 6 * 60],
+      ['RIDESHARE', 600],
+    ]);
+    expect(option.startTime).toBe('2026-12-01T16:00:00.000Z');
+    expect(option.durationSec).toBe(1800 + 360 + 360 + 600);
+
+    const arriveBy = buildParkAndRideshareOption({ ...request, arriveBy: true }, hub, d(1800), d(600));
+    expect(arriveBy.endTime).toBe('2026-12-01T16:00:00.000Z');
   });
 });

@@ -9,14 +9,14 @@
   import UsageFooter from './components/UsageFooter.svelte';
   import { api, AuthError } from './lib/api';
   import { toLocalInputValue } from './lib/format';
-  import { planTrip, type PlanResult } from './lib/planner';
+  import { estimateCost, planTrip, type PlanResult } from './lib/planner';
   import { load, save } from './lib/storage';
   import type { LatLon, NamedPlace, TripSettings, UsageReport } from './lib/types';
 
   const DEFAULT_SETTINGS: TripSettings = {
-    firstLeg: 'CAR_PARKING',
+    firstLegs: ['CAR_PARKING'],
     transit: ['LIGHT_RAIL', 'SUBWAY', 'TRAIN'],
-    lastLeg: 'WALK',
+    lastLegs: ['WALK'],
     maxFirstLegMin: 30,
     maxLastLegMin: 15,
     parkBufferMin: 5,
@@ -26,7 +26,8 @@
 
   let auth = $state<'checking' | 'signed-out' | 'signed-in'>('checking');
   let trafficEnabled = $state(false);
-  let settings = $state<TripSettings>(load('settings', DEFAULT_SETTINGS));
+  // v2: first/last legs became lists; older saved settings are ignored.
+  let settings = $state<TripSettings>(load('settings.v2', DEFAULT_SETTINGS));
   let from = $state<NamedPlace | null>(null);
   let to = $state<NamedPlace | null>(null);
   let timeMode = $state<'now' | 'depart' | 'arrive'>('now');
@@ -45,10 +46,11 @@
   let controller: AbortController | undefined;
   let resultsTop: HTMLElement | undefined = $state();
 
-  const allOptions = $derived(result ? [...result.options, ...(result.direct ? [result.direct] : [])] : []);
+  const allOptions = $derived(result ? [...result.options, ...result.direct] : []);
+  const estimate = $derived(estimateCost(settings, trafficEnabled));
   const selected = $derived(allOptions.find((o) => o.id === selectedId) ?? null);
 
-  $effect(() => save('settings', $state.snapshot(settings)));
+  $effect(() => save('settings.v2', $state.snapshot(settings)));
 
   async function checkSession() {
     try {
@@ -101,7 +103,7 @@
         { trafficEnabled, signal: controller.signal, onProgress: (m) => (progress = m) },
       );
       result = res;
-      selectedId = res.options[0]?.id ?? res.direct?.id ?? null;
+      selectedId = res.options[0]?.id ?? res.direct[0]?.id ?? null;
       await tick();
       resultsTop?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (err) {
@@ -198,6 +200,10 @@
         <button type="submit" class="primary" disabled={busy || auth !== 'signed-in'}>
           {busy ? progress || 'Searching…' : 'Find routes'}
         </button>
+        <p class="cost estimate">
+          Uses up to {estimate.tomtom} TomTom route{estimate.tomtom === 1 ? '' : 's'} and
+          {estimate.transitous} Transitous quer{estimate.transitous === 1 ? 'y' : 'ies'}.
+        </p>
       </form>
 
       {#if error}<p class="error">{error}</p>{/if}
@@ -374,6 +380,10 @@
     margin: 0;
     font-size: 0.8rem;
     color: var(--muted);
+  }
+  .estimate {
+    margin-top: -0.4rem;
+    text-align: center;
   }
   footer {
     margin-top: auto;

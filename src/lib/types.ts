@@ -135,9 +135,9 @@ export type TransitChoice = 'LIGHT_RAIL' | 'SUBWAY' | 'TRAIN' | 'BUS' | 'FERRY';
 export type LastLeg = 'WALK' | 'BIKE' | 'RENTAL' | 'RIDESHARE';
 
 export interface TripSettings {
-  firstLeg: FirstLeg;
+  firstLegs: FirstLeg[];
   transit: TransitChoice[];
-  lastLeg: LastLeg;
+  lastLegs: LastLeg[];
   maxFirstLegMin: number;
   maxLastLegMin: number;
   parkBufferMin: number;
@@ -151,6 +151,12 @@ export interface TripRequest extends TripSettings {
   /** null = leave now */
   time: Date | null;
   arriveBy: boolean;
+}
+
+/** One first-leg/last-leg pairing of a request; the planner runs each pairing separately. */
+export interface LegCombo extends TripRequest {
+  firstLeg: FirstLeg;
+  lastLeg: LastLeg;
 }
 
 export interface DisplayLeg {

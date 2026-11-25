@@ -1,6 +1,6 @@
 # MultiModalNav
 
-A park-and-ride and multimodal trip planner, built as an installable web app (PWA). Pick a mode for each leg of the trip (drive and park, drop-off, rideshare, bike or walk to transit; light rail, subway, train, bus or ferry; then walk, bike, a share bike/scooter or rideshare to the destination). For drive-first trips it compares several stations using traffic-aware drive times and shows which one gets you there first.
+A park-and-ride and multimodal trip planner, built as an installable web app (PWA). Pick one or more modes for each leg of the trip (drive and park, drop-off, rideshare, bike or walk to transit; light rail, subway, train, bus or ferry; then walk, bike, a share bike/scooter or rideshare to the destination), and every combination is compared side by side. For drive-first trips it compares several stations using traffic-aware drive times and shows which one gets you there first.
 
 ## How it works
 
@@ -25,7 +25,11 @@ A **rideshare last leg** works the same way from the other end. The app finds up
 
 Walk-first and bike-first searches are a single Transitous query (plus the rideshare lookups if the last leg is a rideshare).
 
-**Free tier use per drive-first search** (default 6 stations): about 7 TomTom routes (11 with a rideshare last leg) and 7 Transitous queries, plus station lists, which are cached for a week. TomTom's free 20,000 routes a month works out to about 1,800 to 2,800 searches. Transitous asks to be contacted above about 720 plan queries a day, which is roughly 100 searches.
+With several modes selected, each first/last pairing is planned separately, because one combined query would only return the fastest mode. TomTom lookups, Transitous's park-and-ride pick and the rideshare stations are shared between pairings. Queries are kept to 3 at a time for Transitous and 2 for TomTom, and the server retries their "too many requests" responses.
+
+**No-transit comparisons** appear under "For comparison": driving or rideshare the whole way, walking or biking the whole way, and, when both "Drive & park" and "Rideshare" are selected, **park near the destination and rideshare the rest**. That last one parks at a station lot near the destination (from the rideshare search) and doesn't count against the max-drive limit.
+
+**Free tier use per drive-first search** (default 6 stations): about 7 TomTom routes (11 with a rideshare last leg) and 7 Transitous queries, plus station lists, which are cached for a week. Each extra first/last pairing adds up to 6 Transitous queries for a car first leg, or 1 for walk or bike. The app shows an estimate under **Find routes** before you search. TomTom's free 20,000 routes a month works out to roughly 1,800 to 2,800 single-mode searches. Transitous asks to be contacted above about 720 plan queries a day, which is roughly 100 searches.
 
 ### Usage tracking
 

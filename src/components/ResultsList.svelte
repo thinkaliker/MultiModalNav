@@ -5,7 +5,7 @@
 
   interface Props {
     options: TripOption[];
-    direct?: TripOption;
+    direct: TripOption[];
     selectedId: string | null;
     onselect: (id: string) => void;
     onopen: (id: string) => void;
@@ -52,10 +52,12 @@
   </ol>
 {/if}
 
-{#if direct}
+{#if direct.length}
   <h3>For comparison</h3>
   <ol class="results">
-    {@render card(direct, null)}
+    {#each direct as opt (opt.id)}
+      {@render card(opt, null)}
+    {/each}
   </ol>
 {/if}
 

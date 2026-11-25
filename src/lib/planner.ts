@@ -6,6 +6,7 @@ import { decodePolyline } from './polyline';
 import { stationsNear } from './stations';
 import type {
   DisplayLeg,
+  LegCombo,
   PlanOffset,
   LatLon,
   MotisItinerary,
@@ -17,6 +18,7 @@ import type {
   TomTomRouteResponse,
   TripOption,
   TripRequest,
+  TripSettings,
 } from './types';
 
 // Rough speeds used only to pre-rank candidate stations and as a fallback without traffic data.
@@ -53,7 +55,7 @@ export interface Drive {
 
 export interface PlanResult {
   options: TripOption[];
-  direct?: TripOption;
+  direct: TripOption[];
   notes: string[];
   usage: SearchUsage;
 }
@@ -381,7 +383,7 @@ function alternativesOf(sorted: MotisItinerary[]): TripOption['alternatives'] {
 const rideshareWaitSec = (req: TripRequest) => req.rideshareWaitMin * 60;
 
 /** Everything between leaving the start and the platform, beyond the drive itself. */
-export function firstLegBufferSec(req: TripRequest): number {
+export function firstLegBufferSec(req: LegCombo): number {
   if (req.firstLeg === 'CAR_PARKING') return req.parkBufferMin * 60;
   if (req.firstLeg === 'RIDESHARE') return rideshareWaitSec(req) + CURB_SEC;
   return CURB_SEC;
@@ -391,7 +393,7 @@ const FIRST_LEG_TITLE: Record<string, string> = { CAR_PARKING: 'Park at', CAR_DR
 const FIRST_LEG_VERB: Record<string, string> = { CAR_PARKING: 'Drive to', CAR_DROPOFF: 'Get dropped off at', RIDESHARE: 'Rideshare to' };
 
 export function buildParkRideOption(
-  req: TripRequest,
+  req: LegCombo,
   candidate: Candidate,
   drive: Drive,
   offsetSec: number,
@@ -437,7 +439,7 @@ export function buildParkRideOption(
   legs.push(...displayLegs(rest, req, lastMile));
 
   return {
-    id: `parkride:${candidate.key}`,
+    id: `parkride:${req.firstLeg}:${req.lastLeg}:${candidate.key}`,
     kind: 'parkride',
     title: `${FIRST_LEG_TITLE[req.firstLeg] ?? 'Via'} ${candidate.name}`,
     startTime: best.startTime,
@@ -460,10 +462,16 @@ export function buildParkRideOption(
 export function itineraryOption(req: TripRequest, it: MotisItinerary, id: string, lastMile?: LastMile): TripOption {
   const legs = displayLegs(it.legs, req, lastMile);
   const board = it.legs.find((l) => !STREET_MODES.has(l.mode));
+  const first = it.legs[0];
+  let title = `${STREET_VERB[first?.mode] ?? 'Go'} the whole way`;
+  if (board) {
+    const station = placeName(board.from, req);
+    title = first === board ? `Board at ${station}` : `${STREET_VERB[first.mode] ?? 'Go'} to ${station}`;
+  }
   return {
     id,
     kind: board ? 'transit' : 'direct',
-    title: board ? `Board at ${placeName(board.from, req)}` : `${STREET_VERB[it.legs[0]?.mode] ?? 'Go'} the whole way`,
+    title,
     startTime: it.startTime,
     endTime: it.endTime,
     durationSec: it.duration,
@@ -475,7 +483,7 @@ export function itineraryOption(req: TripRequest, it: MotisItinerary, id: string
   };
 }
 
-function directCarOption(req: TripRequest, drive: Drive): TripOption {
+function directCarOption(req: LegCombo, drive: Drive): TripOption {
   const rideshare = req.firstLeg === 'RIDESHARE';
   const waitSec = rideshare ? rideshareWaitSec(req) : 0;
   const totalSec = waitSec + drive.seconds;
@@ -489,7 +497,7 @@ function directCarOption(req: TripRequest, drive: Drive): TripOption {
     streetLeg(rideshare ? 'RIDESHARE' : 'CAR', `${rideshare ? 'Rideshare' : 'Drive'} to ${req.to.name}`, driveStart, end, req.from, req.to, driveExtras(drive)),
   );
   return {
-    id: 'direct:car',
+    id: rideshare ? 'direct:rideshare' : 'direct:car',
     kind: 'direct',
     title: rideshare ? 'Rideshare the whole way' : 'Drive the whole way',
     startTime: iso(start),
@@ -503,7 +511,45 @@ function directCarOption(req: TripRequest, drive: Drive): TripOption {
   };
 }
 
-function baseParams(req: TripRequest): PlanParams {
+/** Drive to a station lot near the destination, park, and rideshare the rest: no transit at all. */
+export function buildParkAndRideshareOption(
+  req: TripRequest,
+  hub: Candidate,
+  drive: Drive,
+  ride: Drive,
+): TripOption {
+  const parkSec = req.parkBufferMin * 60 + CURB_SEC;
+  const waitSec = rideshareWaitSec(req);
+  const totalSec = drive.seconds + parkSec + waitSec + ride.seconds;
+  const anchor = (req.time ?? new Date()).getTime();
+  const start = req.arriveBy ? anchor - totalSec * 1000 : anchor;
+  const parked = start + drive.seconds * 1000;
+  const atPickup = parked + parkSec * 1000;
+  const pickedUp = atPickup + waitSec * 1000;
+  const end = start + totalSec * 1000;
+  const hubPlace: NamedPlace = { name: hub.name, ...hub.station };
+  return {
+    id: `parkrideshare:${hub.key}`,
+    kind: 'parkride',
+    title: `Park at ${hub.name}, rideshare the rest`,
+    startTime: iso(start),
+    endTime: iso(end),
+    durationSec: totalSec,
+    transfers: 0,
+    legs: [
+      streetLeg('CAR', `Drive to ${hub.name}`, start, parked, req.from, hubPlace, driveExtras(drive)),
+      streetLeg('PARK', 'Park and walk to the pickup spot', parked, atPickup, { ...hubPlace, name: 'Parking' }, hubPlace),
+      streetLeg('WAIT', 'Wait for your ride', atPickup, pickedUp, hubPlace, hubPlace),
+      streetLeg('RIDESHARE', `Rideshare to ${req.to.name}`, pickedUp, end, hubPlace, req.to, driveExtras(ride)),
+    ],
+    station: hubPlace,
+    alternatives: [],
+    traffic: { label: 'Drive', driveSec: drive.seconds, delaySec: drive.delaySec, estimated: drive.estimated },
+    realTime: false,
+  };
+}
+
+function baseParams(req: LegCombo): PlanParams {
   return {
     fromPlace: fmtLatLon(req.from),
     toPlace: fmtLatLon(req.to),
@@ -522,14 +568,48 @@ interface PlanOptions {
   onProgress?: (message: string) => void;
 }
 
+/** State shared by all leg combinations of one search, so lookups aren't repeated. */
 interface PlanContext extends PlanOptions {
   usage: SearchUsage;
+  /** Caps concurrent Transitous queries across the whole search. */
+  transitousSlot: Limiter;
+  notes: string[];
+  driver: Driver;
+  /** Transitous's own park-and-ride / drop-off pick, per first-mile mode. */
+  discovery(req: LegCombo, mode: string): Promise<PlanResponse | null>;
+  /** Rideshare options from stations near the destination, computed once. */
+  lastMile(): Promise<LastMile | undefined>;
+  stats: { tried: number; missing: number };
 }
+
+type Limiter = <T>(task: () => Promise<T>) => Promise<T>;
+
+/** Runs at most `limit` tasks at a time. */
+function makeLimiter(limit: number): Limiter {
+  let active = 0;
+  const queue: (() => void)[] = [];
+  return async (task) => {
+    if (active >= limit) await new Promise<void>((resolve) => queue.push(resolve));
+    else active++;
+    try {
+      return await task();
+    } finally {
+      const next = queue.shift();
+      if (next) next();
+      else active--;
+    }
+  };
+}
+
+// Transitous answers bursts with HTTP 429, so keep a search's queries to a few at a time.
+const TRANSITOUS_CONCURRENCY = 3;
 
 /** Transitous plan queries, counted toward this search's usage. */
 function planQuery(ctx: PlanContext, params: PlanParams, offsets?: Parameters<typeof api.planWithOffsets>[1]) {
-  ctx.usage.transitous++;
-  return offsets ? api.planWithOffsets(params, offsets, ctx.signal) : api.plan(params, ctx.signal);
+  return ctx.transitousSlot(() => {
+    ctx.usage.transitous++;
+    return offsets ? api.planWithOffsets(params, offsets, ctx.signal) : api.plan(params, ctx.signal);
+  });
 }
 
 function rethrowIfFatal(err: unknown, signal?: AbortSignal) {
@@ -540,23 +620,41 @@ function rethrowIfFatal(err: unknown, signal?: AbortSignal) {
 const TOMTOM_CONCURRENCY = 2;
 
 /**
- * Traffic-aware drives via TomTom. A failed lookup falls back to an estimate for that leg;
- * TomTom is skipped entirely once the key is rejected or the monthly limit is reached.
+ * Traffic-aware drives via TomTom, de-duplicated within a search. A failed lookup falls back
+ * to an estimate for that leg; TomTom is skipped entirely once the key is rejected or the
+ * monthly limit is reached.
  */
-function makeDriver({ trafficEnabled, signal, usage }: PlanContext) {
+function makeDriver({ trafficEnabled, signal, usage }: PlanOptions & { usage: SearchUsage }) {
   let disabled = !trafficEnabled;
   let anyFailed = !trafficEnabled;
   let limitReached = false;
   let lastError = '';
-  let active = 0;
-  const queue: (() => void)[] = [];
-  const acquire = () =>
-    active < TOMTOM_CONCURRENCY ? (active++, Promise.resolve()) : new Promise<void>((resolve) => queue.push(resolve));
-  const release = () => {
-    const next = queue.shift();
-    if (next) next();
-    else active--;
-  };
+  const memo = new Map<string, Promise<Drive>>();
+  const slot = makeLimiter(TOMTOM_CONCURRENCY);
+
+  async function lookup(from: LatLon, to: LatLon, timing: DriveTiming): Promise<Drive> {
+    try {
+      if (disabled) return estimateDrive(from, to);
+      const res = await api.trafficRoute(from, to, timing, signal);
+      usage.tomtom++;
+      if (res.routes?.length) return driveFromTomTom(res);
+    } catch (err) {
+      rethrowIfFatal(err, signal);
+      anyFailed = true;
+      lastError = (err as Error).message;
+      if (err instanceof ApiError && err.status === 429) {
+        // The server refuses without calling TomTom once the monthly limit is reached.
+        limitReached = true;
+        disabled = true;
+      } else {
+        usage.tomtom++;
+        // A rejected key won't start working mid-search.
+        if (err instanceof ApiError && (err.upstreamStatus === 401 || err.upstreamStatus === 403)) disabled = true;
+      }
+    }
+    return estimateDrive(from, to);
+  }
+
   return {
     get failed() {
       return anyFailed;
@@ -566,31 +664,15 @@ function makeDriver({ trafficEnabled, signal, usage }: PlanContext) {
       if (limitReached) return 'The TomTom monthly limit has been reached; car times are estimates until next month.';
       return `Some traffic lookups failed${lastError ? ` (${lastError})` : ''}; those car times are estimates.`;
     },
-    async route(from: LatLon, to: LatLon, departure: Date): Promise<Drive> {
-      if (disabled) return estimateDrive(from, to);
-      await acquire();
-      try {
-        if (disabled) return estimateDrive(from, to);
-        const res = await api.trafficRoute(from, to, driveTiming(departure), signal);
-        usage.tomtom++;
-        if (res.routes?.length) return driveFromTomTom(res);
-      } catch (err) {
-        rethrowIfFatal(err, signal);
-        anyFailed = true;
-        lastError = (err as Error).message;
-        if (err instanceof ApiError && err.status === 429) {
-          // The server refuses without calling TomTom once the monthly limit is reached.
-          limitReached = true;
-          disabled = true;
-        } else {
-          usage.tomtom++;
-          // A rejected key won't start working mid-search.
-          if (err instanceof ApiError && (err.upstreamStatus === 401 || err.upstreamStatus === 403)) disabled = true;
-        }
-      } finally {
-        release();
+    route(from: LatLon, to: LatLon, departure: Date): Promise<Drive> {
+      const timing = driveTiming(departure);
+      const key = `${fmtLatLon(from)}>${fmtLatLon(to)}@${timing.departAt}`;
+      let pending = memo.get(key);
+      if (!pending) {
+        pending = slot(() => lookup(from, to, timing));
+        memo.set(key, pending);
       }
-      return estimateDrive(from, to);
+      return pending;
     },
   };
 }
@@ -614,7 +696,7 @@ async function prepareRideshareLastMile(
   // Same ranking as for the first leg, seen from the destination's side.
   const candidates = pickCandidates(nearby, [], req.to, req.from, maxKm, Math.min(req.stationsToCompare, MAX_RIDESHARE_STATIONS));
   if (!candidates.length) {
-    notes.push(`No stations within about ${req.maxLastLegMin} minutes’ ride of the destination; showing a walking last leg instead.`);
+    notes.push(`No stations within about ${req.maxLastLegMin} minutes’ ride of the destination, so there are no rideshare options.`);
     return undefined;
   }
   const anchor = req.time ?? new Date();
@@ -645,89 +727,158 @@ async function prepareRideshareLastMile(
   };
 }
 
-export async function planTrip(req: TripRequest, opts: PlanOptions): Promise<PlanResult> {
-  const ctx: PlanContext = { ...opts, usage: { tomtom: 0, transitous: 0 } };
-  const result = await (isCarFirst(req.firstLeg) ? planCarFirst(req, ctx) : planStreetFirst(req, ctx));
-  return { ...result, usage: ctx.usage };
+/** Upper-bound estimate of the upstream calls a search with these settings makes. */
+export function estimateCost(s: TripSettings, trafficEnabled: boolean): SearchUsage {
+  const car = s.firstLegs.filter(isCarFirst);
+  const street = s.firstLegs.length - car.length;
+  const discoveries = new Set(car.map((m) => (m === 'CAR_PARKING' ? 'CAR_PARKING' : 'CAR_DROPOFF'))).size;
+  const rideshareLast = s.lastLegs.includes('RIDESHARE');
+  const rideshareStations = Math.min(s.stationsToCompare, MAX_RIDESHARE_STATIONS);
+  const transitous = discoveries + car.length * s.lastLegs.length * s.stationsToCompare + street * s.lastLegs.length;
+  let tomtom = 0;
+  if (trafficEnabled) {
+    if (car.length) tomtom += s.stationsToCompare + discoveries; // station drives + drive the whole way
+    if (rideshareLast) tomtom += rideshareStations;
+    if (rideshareLast && s.firstLegs.includes('CAR_PARKING')) tomtom += rideshareStations; // park & rideshare
+  }
+  return { tomtom, transitous };
 }
 
-type PartialResult = Omit<PlanResult, 'usage'>;
+const MAX_OPTIONS = 15;
 
-async function planStreetFirst(req: TripRequest, ctx: PlanContext): Promise<PartialResult> {
-  const { signal, onProgress } = ctx;
+export async function planTrip(req: TripRequest, opts: PlanOptions): Promise<PlanResult> {
+  const usage: SearchUsage = { tomtom: 0, transitous: 0 };
   const notes: string[] = [];
-  const driver = makeDriver(ctx);
-  const params: PlanParams = {
-    ...baseParams(req),
-    preTransitModes: req.firstLeg,
-    maxPreTransitTime: req.maxFirstLegMin * 60,
-    directModes: req.firstLeg,
+  const driver = makeDriver({ ...opts, usage });
+  const discoveries = new Map<string, Promise<PlanResponse | null>>();
+  let lastMile: Promise<LastMile | undefined> | undefined;
+  const ctx: PlanContext = {
+    ...opts,
+    usage,
+    transitousSlot: makeLimiter(TRANSITOUS_CONCURRENCY),
+    notes,
+    driver,
+    stats: { tried: 0, missing: 0 },
+    discovery(combo, mode) {
+      let pending = discoveries.get(mode);
+      if (!pending) {
+        pending = planQuery(ctx, {
+          ...baseParams({ ...combo, lastLeg: 'WALK' }),
+          preTransitModes: mode,
+          maxPreTransitTime: req.maxFirstLegMin * 60,
+        }).catch((err) => {
+          rethrowIfFatal(err, opts.signal);
+          return null;
+        });
+        discoveries.set(mode, pending);
+      }
+      return pending;
+    },
+    lastMile: () => (lastMile ??= prepareRideshareLastMile(req, driver, notes, opts.signal)),
   };
 
-  let lastMile: LastMile | undefined;
-  if (req.lastLeg === 'RIDESHARE') {
-    onProgress?.('Checking rideshare times…');
-    lastMile = await prepareRideshareLastMile(req, driver, notes, signal);
-    if (lastMile && driver.failed) notes.push(driver.note);
-  }
+  const combos: LegCombo[] = req.firstLegs.flatMap((firstLeg) => req.lastLegs.map((lastLeg) => ({ ...req, firstLeg, lastLeg })));
+  const [results, parkAndRideshare] = await Promise.all([
+    mapLimit(combos, 2, (combo) => (isCarFirst(combo.firstLeg) ? planCarFirst(combo, ctx) : planStreetFirst(combo, ctx))),
+    req.firstLegs.includes('CAR_PARKING') && req.lastLegs.includes('RIDESHARE') ? planParkAndRideshare(req, ctx) : undefined,
+  ]);
 
-  onProgress?.('Planning…');
-  const res = await planQuery(ctx, params, lastMile ? { toOffsets: lastMile.offsets } : undefined);
-  const options = sortOptions(
-    res.itineraries.map((it, i) => itineraryOption(req, it, `transit:${i}`, lastMile)),
-    req.arriveBy,
-  ).slice(0, 8);
-  const direct = res.direct[0] ? itineraryOption(req, res.direct[0], 'direct:street') : undefined;
-  if (!options.length) notes.push('No transit connections found. Try more transit modes or a longer first/last leg.');
-  return { options, direct, notes };
+  const all = sortOptions(results.flatMap((r) => r.options), req.arriveBy);
+  const options = all.slice(0, MAX_OPTIONS);
+  // No-transit alternatives, for comparison.
+  const direct = [
+    ...new Map(results.flatMap((r) => r.direct).map((o) => [o.id, o])).values(),
+    ...(parkAndRideshare ? [parkAndRideshare] : []),
+  ];
+
+  if (driver.failed && usesCar(req)) notes.push(driver.note);
+  if (ctx.stats.missing) {
+    notes.push(`${ctx.stats.missing} of ${ctx.stats.tried} station options had no connection in the search window.`);
+  }
+  if (all.length > MAX_OPTIONS) notes.push(`Showing the ${MAX_OPTIONS} best of ${all.length} options.`);
+  if (!all.length) notes.push('No transit connections found. Try more transit modes or a longer first/last leg.');
+  return { options, direct, notes: [...new Set(notes)], usage };
 }
 
-async function planCarFirst(req: TripRequest, ctx: PlanContext): Promise<PartialResult> {
-  const { trafficEnabled, signal, onProgress } = ctx;
-  const notes: string[] = [];
+const usesCar = (req: TripRequest) => req.firstLegs.some(isCarFirst) || req.lastLegs.includes('RIDESHARE');
+
+interface ComboResult {
+  options: TripOption[];
+  direct: TripOption[];
+}
+
+async function planStreetFirst(req: LegCombo, ctx: PlanContext): Promise<ComboResult> {
+  ctx.onProgress?.('Planning…');
+  const lastMile = req.lastLeg === 'RIDESHARE' ? await ctx.lastMile() : undefined;
+  if (req.lastLeg === 'RIDESHARE' && !lastMile) return { options: [], direct: [] };
+  let res: PlanResponse;
+  try {
+    res = await planQuery(
+      ctx,
+      {
+        ...baseParams(req),
+        preTransitModes: req.firstLeg,
+        maxPreTransitTime: req.maxFirstLegMin * 60,
+        directModes: req.firstLeg,
+      },
+      lastMile ? { toOffsets: lastMile.offsets } : undefined,
+    );
+  } catch (err) {
+    rethrowIfFatal(err, ctx.signal);
+    ctx.notes.push(`Couldn’t plan ${req.firstLeg.toLowerCase()} → ${req.lastLeg.toLowerCase()} trips (${(err as Error).message}).`);
+    return { options: [], direct: [] };
+  }
+  const prefix = `transit:${req.firstLeg}:${req.lastLeg}`;
+  if (!res.itineraries.length) {
+    ctx.notes.push(
+      `No ${req.firstLeg.toLowerCase()} → transit → ${req.lastLeg.toLowerCase()} trips within your limits; try a longer first or last leg, or more transit modes.`,
+    );
+  }
+  return {
+    options: sortOptions(
+      res.itineraries.map((it, i) => itineraryOption(req, it, `${prefix}:${i}`, lastMile)),
+      req.arriveBy,
+    ).slice(0, 8),
+    direct: res.direct.slice(0, 1).map((it) => itineraryOption(req, it, `direct:${req.firstLeg}`)),
+  };
+}
+
+async function planCarFirst(req: LegCombo, ctx: PlanContext): Promise<ComboResult> {
+  const { trafficEnabled, signal, onProgress, driver } = ctx;
   const base = baseParams(req);
   const maxKm = maxDriveKm(req.maxFirstLegMin);
-  const driver = makeDriver(ctx);
   const anchor = req.time ?? new Date();
 
   onProgress?.('Finding stations…');
   const [discovery, nearby, lastMile] = await Promise.all([
-    planQuery(ctx, {
-      ...base,
-      // Transitous has no rideshare mode; a drop-off has the same shape.
-      preTransitModes: req.firstLeg === 'RIDESHARE' ? 'CAR_DROPOFF' : req.firstLeg,
-      maxPreTransitTime: req.maxFirstLegMin * 60,
-    }).catch((err) => {
-        rethrowIfFatal(err, signal);
-        return null;
-      }),
+    // Transitous has no rideshare mode; a drop-off has the same shape.
+    ctx.discovery(req, req.firstLeg === 'RIDESHARE' ? 'CAR_DROPOFF' : req.firstLeg),
     stationsNear(req.from, maxKm, motisTransitModes(req.transit), (tile) =>
       inCorridor(req.from, req.to, tileCenter(tile), 2 * tileHalfDiagonalKm(tile)),
     ).catch((err) => {
       rethrowIfFatal(err, signal);
-      notes.push('Could not load the station list; only Transitous’s own pick is shown.');
+      ctx.notes.push('Could not load the station list; only Transitous’s own pick is shown.');
       return [] as MotisPlace[];
     }),
-    req.lastLeg === 'RIDESHARE' ? prepareRideshareLastMile(req, driver, notes, signal) : Promise.resolve(undefined),
+    req.lastLeg === 'RIDESHARE' ? ctx.lastMile() : Promise.resolve(undefined),
   ]);
+  // Departure times ignore the rideshare pickup wait so all car modes share the same lookups.
+  const departureFor = (estimatedTripSec: number) => (req.arriveBy ? addSec(anchor, -estimatedTripSec) : anchor);
+  const directDrive = driver.route(req.from, req.to, departureFor(estimateDrive(req.from, req.to).seconds));
+  const direct = [directCarOption(req, await directDrive)];
+  if (req.lastLeg === 'RIDESHARE' && !lastMile) return { options: [], direct };
+
   const discovered = discovery ? discoveryCandidates(discovery, req.from, req.to) : [];
   const nearbyPicks = pickCandidates(nearby, discovered, req.from, req.to, maxKm, req.stationsToCompare);
   if (!nearbyPicks.length) {
-    notes.push(`No stations found within about ${req.maxFirstLegMin} minutes’ drive for the selected transit modes.`);
-    return { options: [], notes };
+    ctx.notes.push(`No stations found within about ${req.maxFirstLegMin} minutes’ drive for the selected transit modes.`);
+    return { options: [], direct };
   }
 
   onProgress?.(trafficEnabled ? `Checking traffic to ${nearbyPicks.length} stations…` : 'Estimating drive times…');
-  const waitSec = req.firstLeg === 'RIDESHARE' ? rideshareWaitSec(req) : 0;
-  const departureFor = (estimatedTripSec: number) =>
-    req.arriveBy ? addSec(anchor, -estimatedTripSec) : addSec(anchor, waitSec);
-  const [allDrives, directDrive] = await Promise.all([
-    mapLimit(nearbyPicks, 4, (c) => driver.route(req.from, c.park, departureFor(c.estimateSec))),
-    driver.route(req.from, req.to, departureFor(estimateDrive(req.from, req.to).seconds + waitSec)),
-  ]);
-  if (driver.failed) notes.push(driver.note);
+  const allDrives = await Promise.all(nearbyPicks.map((c) => driver.route(req.from, c.park, departureFor(c.estimateSec))));
   const { keep, relaxed } = withinLimit(allDrives, req.maxFirstLegMin * 60, 2);
-  if (relaxed) notes.push(`No station is within ${req.maxFirstLegMin} min by car right now; showing the closest.`);
+  if (relaxed) ctx.notes.push(`No station is within ${req.maxFirstLegMin} min by car right now; showing the closest.`);
   const candidates = keep.map((i) => nearbyPicks[i]);
   const drives = keep.map((i) => allDrives[i]);
 
@@ -748,8 +899,28 @@ async function planCarFirst(req: TripRequest, ctx: PlanContext): Promise<Partial
   });
 
   const found = options.filter((o): o is TripOption => o !== null);
-  if (found.length < candidates.length) {
-    notes.push(`${candidates.length - found.length} of ${candidates.length} stations had no connection in the search window.`);
-  }
-  return { options: sortOptions(found, req.arriveBy), direct: directCarOption(req, directDrive), notes };
+  ctx.stats.tried += candidates.length;
+  ctx.stats.missing += candidates.length - found.length;
+  return { options: found, direct };
+}
+
+/**
+ * The best "park near the destination and rideshare the rest" option. Like driving the whole
+ * way it's a no-transit comparison, so the max-drive limit doesn't apply.
+ */
+async function planParkAndRideshare(req: TripRequest, ctx: PlanContext): Promise<TripOption | undefined> {
+  const lastMile = await ctx.lastMile();
+  if (!lastMile) return undefined;
+  const anchor = req.time ?? new Date();
+  const options = await Promise.all(
+    lastMile.candidates.map(async (hub, i) => {
+      const ride = lastMile.drives[i];
+      const departure = req.arriveBy
+        ? addSec(anchor, -(estimateDrive(req.from, hub.station).seconds + lastMile.waitSec + ride.seconds))
+        : anchor;
+      const drive = await ctx.driver.route(req.from, hub.station, departure);
+      return buildParkAndRideshareOption(req, hub, drive, ride);
+    }),
+  );
+  return sortOptions(options, req.arriveBy)[0];
 }

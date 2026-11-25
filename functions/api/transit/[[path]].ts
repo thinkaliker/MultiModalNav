@@ -8,6 +8,7 @@ import { userAgent } from '../../_lib/useragent';
 
 const UPSTREAM = 'https://api.transitous.org/api/';
 const MAX_BODY_BYTES = 64 * 1024;
+const MAX_RETRIES = 2;
 
 // path -> methods allowed, edge cache TTL (seconds, 0 = don't cache), and whether it counts
 // toward Transitous's daily guideline (which covers /plan, /one-to-many and /one-to-all).
@@ -46,7 +47,12 @@ export const onRequest: PagesFunction<Env, 'path'> = async ({ request, params, e
 
   if (route.counted && env.USAGE_DB) waitUntil(recordUse(env.USAGE_DB, 'transitous.plan').catch(() => {}));
 
-  const upstream = await fetch(url.toString(), init);
+  let upstream = await fetch(url.toString(), init);
+  // Transitous rate-limits bursts; back off briefly and retry (all allowed routes are read-only).
+  for (let attempt = 1; upstream.status === 429 && attempt <= MAX_RETRIES; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+    upstream = await fetch(url.toString(), init);
+  }
   const headers = new Headers({
     'Content-Type': upstream.headers.get('Content-Type') ?? 'application/json',
     'Cache-Control': route.ttl > 0 && upstream.ok ? `private, max-age=${route.ttl}` : 'no-store',
