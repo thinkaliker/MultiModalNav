@@ -1,0 +1,8 @@
+name = "multimodalnav"
+pages_build_output_dir = "dist"
+compatibility_date = "2025-09-01"
+
+# Secrets (set with `wrangler pages secret put <NAME>` or in the dashboard):
+#   APP_PASSWORD     password required to use the /api endpoints
+#   TOMTOM_API_KEY   TomTom Routing API key (traffic-aware drive times)
+# For local dev, copy .dev.vars.example to .dev.vars.
