@@ -5,6 +5,7 @@ import { limitFor, recordUse } from '../../_lib/usage';
 // GET /api/traffic/route?from=lat,lon&to=lat,lon[&departAt=ISO|now]
 
 const COORD = /^-?\d{1,2}(\.\d+)?,-?\d{1,3}(\.\d+)?$/;
+const MAX_RETRIES = 2;
 
 function validCoord(value: string | null): value is string {
   if (!value || !COORD.test(value)) return false;
@@ -42,14 +43,17 @@ export const onRequestGet: PagesFunction<Env> = async ({ request, env }) => {
   if (departAt !== 'now' && !validTime(departAt)) return json({ error: 'bad departAt' }, 400);
   params.set('departAt', departAt);
 
-  const upstream = await fetch(
-    `https://api.tomtom.com/routing/1/calculateRoute/${from}:${to}/json?${params}`,
-    { headers: { Accept: 'application/json' } },
-  );
+  const url = `https://api.tomtom.com/routing/1/calculateRoute/${from}:${to}/json?${params}`;
+  let upstream = await fetch(url, { headers: { Accept: 'application/json' } });
+  // TomTom's free tier caps requests per second; back off briefly and retry.
+  for (let attempt = 1; upstream.status === 429 && attempt <= MAX_RETRIES; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
+    upstream = await fetch(url, { headers: { Accept: 'application/json' } });
+  }
   if (!upstream.ok) {
     // Don't pass TomTom's status through: the app reads 401 as "signed out" and 429 as our
     // monthly limit. 401/403 here usually means a wrong or disabled TomTom key.
-    return json({ error: `TomTom returned HTTP ${upstream.status}` }, 502);
+    return json({ error: `TomTom returned HTTP ${upstream.status}`, upstreamStatus: upstream.status }, 502);
   }
   return new Response(upstream.body, {
     status: upstream.status,

@@ -19,6 +19,8 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
+    /** Status from the upstream service, when the proxy reports one. */
+    public upstreamStatus?: number,
   ) {
     super(message);
   }
@@ -29,13 +31,15 @@ async function request<T>(url: string, init: RequestInit = {}): Promise<T> {
   if (res.status === 401) throw new AuthError();
   if (!res.ok) {
     let message = `HTTP ${res.status}`;
+    let upstreamStatus: number | undefined;
     try {
       const body = await res.json();
       message = body.error ?? JSON.stringify(body);
+      upstreamStatus = typeof body.upstreamStatus === 'number' ? body.upstreamStatus : undefined;
     } catch {
       // keep the status message
     }
-    throw new ApiError(res.status, message);
+    throw new ApiError(res.status, message, upstreamStatus);
   }
   return res.json() as Promise<T>;
 }

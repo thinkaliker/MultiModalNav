@@ -536,34 +536,59 @@ function rethrowIfFatal(err: unknown, signal?: AbortSignal) {
   if (err instanceof AuthError || signal?.aborted) throw err;
 }
 
-/** Traffic-aware drives via TomTom, falling back to estimates once a lookup fails. */
+// TomTom's free tier limits requests per second, so only a couple go out at once.
+const TOMTOM_CONCURRENCY = 2;
+
+/**
+ * Traffic-aware drives via TomTom. A failed lookup falls back to an estimate for that leg;
+ * TomTom is skipped entirely once the key is rejected or the monthly limit is reached.
+ */
 function makeDriver({ trafficEnabled, signal, usage }: PlanContext) {
-  let failed = !trafficEnabled;
+  let disabled = !trafficEnabled;
+  let anyFailed = !trafficEnabled;
   let limitReached = false;
   let lastError = '';
+  let active = 0;
+  const queue: (() => void)[] = [];
+  const acquire = () =>
+    active < TOMTOM_CONCURRENCY ? (active++, Promise.resolve()) : new Promise<void>((resolve) => queue.push(resolve));
+  const release = () => {
+    const next = queue.shift();
+    if (next) next();
+    else active--;
+  };
   return {
     get failed() {
-      return failed;
+      return anyFailed;
     },
     get note(): string {
       if (!trafficEnabled) return 'Traffic is not configured (TOMTOM_API_KEY); car times are rough estimates.';
       if (limitReached) return 'The TomTom monthly limit has been reached; car times are estimates until next month.';
-      return `Traffic lookup failed${lastError ? ` (${lastError})` : ''}; those car times are estimates.`;
+      return `Some traffic lookups failed${lastError ? ` (${lastError})` : ''}; those car times are estimates.`;
     },
     async route(from: LatLon, to: LatLon, departure: Date): Promise<Drive> {
-      if (!failed) {
-        try {
-          const res = await api.trafficRoute(from, to, driveTiming(departure), signal);
-          usage.tomtom++;
-          if (res.routes?.length) return driveFromTomTom(res);
-        } catch (err) {
-          rethrowIfFatal(err, signal);
+      if (disabled) return estimateDrive(from, to);
+      await acquire();
+      try {
+        if (disabled) return estimateDrive(from, to);
+        const res = await api.trafficRoute(from, to, driveTiming(departure), signal);
+        usage.tomtom++;
+        if (res.routes?.length) return driveFromTomTom(res);
+      } catch (err) {
+        rethrowIfFatal(err, signal);
+        anyFailed = true;
+        lastError = (err as Error).message;
+        if (err instanceof ApiError && err.status === 429) {
           // The server refuses without calling TomTom once the monthly limit is reached.
-          if (err instanceof ApiError && err.status === 429) limitReached = true;
-          else usage.tomtom++;
-          lastError = (err as Error).message;
-          failed = true;
+          limitReached = true;
+          disabled = true;
+        } else {
+          usage.tomtom++;
+          // A rejected key won't start working mid-search.
+          if (err instanceof ApiError && (err.upstreamStatus === 401 || err.upstreamStatus === 403)) disabled = true;
         }
+      } finally {
+        release();
       }
       return estimateDrive(from, to);
     },
