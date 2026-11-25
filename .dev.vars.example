@@ -1,2 +1,4 @@
 APP_PASSWORD=change-me
 TOMTOM_API_KEY=
+# Your email or a URL; Transitous asks every client to identify a contact in its User-Agent.
+TRANSITOUS_CONTACT=

@@ -1,11 +1,11 @@
 import { json, type Env } from '../../_lib/env';
+import { userAgent } from '../../_lib/useragent';
 
 // Thin proxy to the Transitous (MOTIS 2) API. It exists to send a proper User-Agent as the
 // Transitous usage policy asks, and to keep all upstream calls behind the password.
 // Responses are streamed through untouched to keep Worker CPU time minimal.
 
 const UPSTREAM = 'https://api.transitous.org/api/';
-const USER_AGENT = 'MultiModalNav/0.1 (+https://github.com/thinkaliker/MultiModalNav)';
 const MAX_BODY_BYTES = 64 * 1024;
 
 // path -> methods allowed and edge cache TTL (seconds, 0 = don't cache)
@@ -19,7 +19,7 @@ const ROUTES: Record<string, { methods: string[]; ttl: number }> = {
   'experimental/map/routes': { methods: ['GET'], ttl: 86400 },
 };
 
-export const onRequest: PagesFunction<Env, 'path'> = async ({ request, params }) => {
+export const onRequest: PagesFunction<Env, 'path'> = async ({ request, params, env }) => {
   const segments = Array.isArray(params.path) ? params.path : [params.path];
   const path = segments.join('/');
   const route = ROUTES[path];
@@ -31,7 +31,7 @@ export const onRequest: PagesFunction<Env, 'path'> = async ({ request, params })
 
   const init: RequestInit<RequestInitCfProperties> = {
     method: request.method,
-    headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+    headers: { 'User-Agent': userAgent(env.TRANSITOUS_CONTACT), Accept: 'application/json' },
   };
   if (request.method === 'POST') {
     const body = await request.arrayBuffer();

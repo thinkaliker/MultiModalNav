@@ -1,6 +1,8 @@
 export interface Env {
   APP_PASSWORD?: string;
   TOMTOM_API_KEY?: string;
+  /** Contact (email or URL) sent to Transitous in the User-Agent, as its usage policy asks. */
+  TRANSITOUS_CONTACT?: string;
 }
 
 export function json(body: unknown, status = 200, headers: HeadersInit = {}): Response {
