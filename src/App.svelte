@@ -6,11 +6,12 @@
   import MapView from './components/MapView.svelte';
   import PlaceInput from './components/PlaceInput.svelte';
   import ResultsList from './components/ResultsList.svelte';
+  import UsageFooter from './components/UsageFooter.svelte';
   import { api, AuthError } from './lib/api';
   import { toLocalInputValue } from './lib/format';
   import { planTrip, type PlanResult } from './lib/planner';
   import { load, save } from './lib/storage';
-  import type { LatLon, NamedPlace, TripSettings } from './lib/types';
+  import type { LatLon, NamedPlace, TripSettings, UsageReport } from './lib/types';
 
   const DEFAULT_SETTINGS: TripSettings = {
     firstLeg: 'CAR_PARKING',
@@ -40,6 +41,7 @@
   let selectedId = $state<string | null>(null);
   let detailOpen = $state(false);
   let mapExpanded = $state(false);
+  let usage = $state<UsageReport | null>(null);
   let controller: AbortController | undefined;
   let resultsTop: HTMLElement | undefined = $state();
 
@@ -53,6 +55,7 @@
       const session = await api.session();
       trafficEnabled = session.traffic;
       auth = 'signed-in';
+      refreshUsage();
     } catch (err) {
       auth = 'signed-out';
       if (!(err instanceof AuthError)) error = (err as Error).message;
@@ -60,6 +63,14 @@
   }
 
   onMount(checkSession);
+
+  async function refreshUsage() {
+    try {
+      usage = await api.usage();
+    } catch {
+      usage = null;
+    }
+  }
 
   async function search(event?: SubmitEvent) {
     event?.preventDefault();
@@ -99,6 +110,7 @@
     } finally {
       busy = false;
       progress = '';
+      if (auth === 'signed-in') refreshUsage();
     }
   }
 
@@ -193,6 +205,10 @@
       {#if result}
         <div bind:this={resultsTop}></div>
         {#each result.notes as note}<p class="note">{note}</p>{/each}
+        <p class="cost">
+          This search used {result.usage.tomtom} TomTom route{result.usage.tomtom === 1 ? '' : 's'} and
+          {result.usage.transitous} Transitous quer{result.usage.transitous === 1 ? 'y' : 'ies'}.
+        </p>
         <ResultsList
           options={result.options}
           direct={result.direct}
@@ -203,6 +219,7 @@
       {/if}
 
       <footer>
+        {#if auth === 'signed-in'}<UsageFooter report={usage} />{/if}
         Transit routing by <a href="https://transitous.org" target="_blank" rel="noopener">Transitous</a>
         (<a href="https://transitous.org/sources/" target="_blank" rel="noopener">data sources</a>) ·
         traffic by TomTom · map by
@@ -352,6 +369,11 @@
     border: 1px solid #fde68a;
     border-radius: var(--radius);
     padding: 0.45rem 0.6rem;
+  }
+  .cost {
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--muted);
   }
   footer {
     margin-top: auto;

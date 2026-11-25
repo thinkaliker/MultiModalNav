@@ -100,6 +100,26 @@ export interface TomTomRouteResponse {
   }[];
 }
 
+// Usage counters from /api/usage.
+export interface UsageMeter {
+  used: number;
+  limit: number;
+  window: 'month' | 'day';
+  period: string;
+}
+
+export interface UsageReport {
+  tracking: boolean;
+  'tomtom.route'?: UsageMeter;
+  'transitous.plan'?: UsageMeter;
+}
+
+/** Upstream calls made by one search. */
+export interface SearchUsage {
+  tomtom: number;
+  transitous: number;
+}
+
 // App model.
 export interface LatLon {
   lat: number;

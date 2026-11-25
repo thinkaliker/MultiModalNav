@@ -1,4 +1,6 @@
-export interface Env {
+import type { UsageEnv } from './usage';
+
+export interface Env extends UsageEnv {
   APP_PASSWORD?: string;
   TOMTOM_API_KEY?: string;
   /** Contact (email or URL) sent to Transitous in the User-Agent, as its usage policy asks. */

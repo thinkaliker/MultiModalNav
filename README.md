@@ -27,6 +27,15 @@ Walk-first and bike-first searches are a single Transitous query (plus the rides
 
 **Free tier use per drive-first search** (default 6 stations): about 7 TomTom routes (11 with a rideshare last leg) and 7 Transitous queries, plus station lists, which are cached for a week. TomTom's free 20,000 routes a month works out to about 1,800 to 2,800 searches. Transitous asks to be contacted above about 720 plan queries a day, which is roughly 100 searches.
 
+### Usage tracking
+
+After you sign in, the footer shows TomTom routes used this month and Transitous plan queries used today, next to their free-tier limits. The numbers turn amber at 80% and red at the limit. Each set of results also says how many calls that search made.
+
+- Counts are kept in an optional [D1](https://developers.cloudflare.com/d1/) database. They only include this app's calls, and periods are UTC months and days. TomTom's own dashboard is the authoritative figure.
+- **TomTom calls stop at the monthly limit.** The server refuses them without calling TomTom, and drive times fall back to estimates until the next month. This keeps you inside the free tier.
+- **Transitous is only shown, never blocked.** Its daily figure is a guideline for when to contact them, not a hard limit.
+- Without the database, nothing is counted or limited, and the footer says tracking is off.
+
 ## Setup
 
 ### 1. TomTom key (optional but recommended)
@@ -48,7 +57,17 @@ npm test         # unit tests
 npm run check    # type-check the app and the Functions
 ```
 
-### 3. Deploy to Cloudflare Pages
+### 3. Usage tracking database (optional)
+
+```sh
+npx wrangler d1 create multimodalnav-usage
+```
+
+Uncomment the `[[d1_databases]]` block in `wrangler.toml`, paste in the `database_id` the command printed, and commit it. The id isn't secret. The table is created on first use. To change the limits, edit `TOMTOM_MONTHLY_LIMIT` and `TRANSITOUS_DAILY_LIMIT` under `[vars]` in `wrangler.toml`.
+
+Locally, `npx wrangler pages dev --d1 USAGE_DB=usage-local` gives you a throwaway local database without editing `wrangler.toml`.
+
+### 4. Deploy to Cloudflare Pages
 
 **Git integration:** in the Cloudflare dashboard, go to Workers & Pages → Create → Pages → Connect to Git and pick this repo.
 
@@ -73,6 +92,11 @@ npm run deploy
 | `APP_PASSWORD` | yes | Password for the app; also signs the session cookie |
 | `TOMTOM_API_KEY` | no | Traffic-aware drive and rideshare times; without it they're estimates |
 | `TRANSITOUS_CONTACT` | recommended | Your email or a URL, sent to Transitous in the User-Agent (`MultiModalNav/<version> (+<repo>; <contact>)`) as its usage policy asks |
+| `TOMTOM_MONTHLY_LIMIT` | no (in `wrangler.toml`) | TomTom routes per month before calls stop; default 20000 |
+| `TRANSITOUS_DAILY_LIMIT` | no (in `wrangler.toml`) | Transitous plan queries per day shown in the footer; default 720 |
+| `USAGE_DB` | no (D1 binding) | Turns on usage tracking and the TomTom limit |
+
+The first three are **secrets**: set them in the dashboard or with `wrangler pages secret put`, and never put them in `wrangler.toml`, which is public.
 
 ## Password protection
 

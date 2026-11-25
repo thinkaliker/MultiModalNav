@@ -1,4 +1,5 @@
 import { json, type Env } from '../../_lib/env';
+import { limitFor, recordUse } from '../../_lib/usage';
 
 // Traffic-aware car route via the TomTom Routing API. The API key never leaves the server.
 // GET /api/traffic/route?from=lat,lon&to=lat,lon[&departAt=ISO|now]
@@ -23,6 +24,12 @@ export const onRequestGet: PagesFunction<Env> = async ({ request, env }) => {
   const to = q.get('to');
   if (!validCoord(from) || !validCoord(to)) return json({ error: 'from/to must be "lat,lon"' }, 400);
 
+  if (env.USAGE_DB) {
+    // A broken tracker shouldn't break routing, so fail open.
+    const allowed = await recordUse(env.USAGE_DB, 'tomtom.route', limitFor(env, 'tomtom.route')).catch(() => true);
+    if (!allowed) return json({ error: 'monthly_limit_reached' }, 429);
+  }
+
   const params = new URLSearchParams({
     key: env.TOMTOM_API_KEY,
     traffic: 'true',
@@ -39,6 +46,11 @@ export const onRequestGet: PagesFunction<Env> = async ({ request, env }) => {
     `https://api.tomtom.com/routing/1/calculateRoute/${from}:${to}/json?${params}`,
     { headers: { Accept: 'application/json' } },
   );
+  if (!upstream.ok) {
+    // Don't pass TomTom's status through: the app reads 401 as "signed out" and 429 as our
+    // monthly limit. 401/403 here usually means a wrong or disabled TomTom key.
+    return json({ error: `TomTom returned HTTP ${upstream.status}` }, 502);
+  }
   return new Response(upstream.body, {
     status: upstream.status,
     headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },

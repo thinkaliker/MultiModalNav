@@ -1,5 +1,13 @@
 import { fmtLatLon } from './geo';
-import type { GeocodeMatch, LatLon, MotisPlace, PlanOffset, PlanResponse, TomTomRouteResponse } from './types';
+import type {
+  GeocodeMatch,
+  LatLon,
+  MotisPlace,
+  PlanOffset,
+  PlanResponse,
+  TomTomRouteResponse,
+  UsageReport,
+} from './types';
 
 export class AuthError extends Error {
   constructor() {
@@ -56,6 +64,8 @@ export const api = {
     }),
 
   logout: () => request<{ ok: boolean }>('/api/logout', { method: 'POST' }),
+
+  usage: () => request<UsageReport>('/api/usage'),
 
   geocode: (text: string, near: LatLon | null, signal?: AbortSignal) =>
     request<GeocodeMatch[]>(

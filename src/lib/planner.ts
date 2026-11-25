@@ -1,4 +1,4 @@
-import { api, AuthError, type DriveTiming, type PlanParams } from './api';
+import { api, ApiError, AuthError, type DriveTiming, type PlanParams } from './api';
 import { fmtDuration } from './format';
 import { fmtLatLon, haversineKm, tileCenter, tileHalfDiagonalKm } from './geo';
 import { isCarFirst, modeColor, modeTextColor, motisTransitModes, STREET_MODES } from './modes';
@@ -13,6 +13,7 @@ import type {
   MotisPlace,
   NamedPlace,
   PlanResponse,
+  SearchUsage,
   TomTomRouteResponse,
   TripOption,
   TripRequest,
@@ -54,6 +55,7 @@ export interface PlanResult {
   options: TripOption[];
   direct?: TripOption;
   notes: string[];
+  usage: SearchUsage;
 }
 
 // Straight-line reach of a drive; generous because freeways cover ground quickly.
@@ -520,24 +522,46 @@ interface PlanOptions {
   onProgress?: (message: string) => void;
 }
 
+interface PlanContext extends PlanOptions {
+  usage: SearchUsage;
+}
+
+/** Transitous plan queries, counted toward this search's usage. */
+function planQuery(ctx: PlanContext, params: PlanParams, offsets?: Parameters<typeof api.planWithOffsets>[1]) {
+  ctx.usage.transitous++;
+  return offsets ? api.planWithOffsets(params, offsets, ctx.signal) : api.plan(params, ctx.signal);
+}
+
 function rethrowIfFatal(err: unknown, signal?: AbortSignal) {
   if (err instanceof AuthError || signal?.aborted) throw err;
 }
 
 /** Traffic-aware drives via TomTom, falling back to estimates once a lookup fails. */
-function makeDriver(trafficEnabled: boolean, signal?: AbortSignal) {
+function makeDriver({ trafficEnabled, signal, usage }: PlanContext) {
   let failed = !trafficEnabled;
+  let limitReached = false;
+  let lastError = '';
   return {
     get failed() {
       return failed;
+    },
+    get note(): string {
+      if (!trafficEnabled) return 'Traffic is not configured (TOMTOM_API_KEY); car times are rough estimates.';
+      if (limitReached) return 'The TomTom monthly limit has been reached; car times are estimates until next month.';
+      return `Traffic lookup failed${lastError ? ` (${lastError})` : ''}; those car times are estimates.`;
     },
     async route(from: LatLon, to: LatLon, departure: Date): Promise<Drive> {
       if (!failed) {
         try {
           const res = await api.trafficRoute(from, to, driveTiming(departure), signal);
+          usage.tomtom++;
           if (res.routes?.length) return driveFromTomTom(res);
         } catch (err) {
           rethrowIfFatal(err, signal);
+          // The server refuses without calling TomTom once the monthly limit is reached.
+          if (err instanceof ApiError && err.status === 429) limitReached = true;
+          else usage.tomtom++;
+          lastError = (err as Error).message;
           failed = true;
         }
       }
@@ -547,12 +571,6 @@ function makeDriver(trafficEnabled: boolean, signal?: AbortSignal) {
 }
 
 type Driver = ReturnType<typeof makeDriver>;
-
-function trafficNote(trafficEnabled: boolean): string {
-  return trafficEnabled
-    ? 'Traffic lookup failed for some legs; those car times are estimates.'
-    : 'Traffic is not configured (TOMTOM_API_KEY); car times are rough estimates.';
-}
 
 /** Stations near the destination, each with a traffic-aware rideshare time to it. */
 async function prepareRideshareLastMile(
@@ -603,12 +621,17 @@ async function prepareRideshareLastMile(
 }
 
 export async function planTrip(req: TripRequest, opts: PlanOptions): Promise<PlanResult> {
-  return isCarFirst(req.firstLeg) ? planCarFirst(req, opts) : planStreetFirst(req, opts);
+  const ctx: PlanContext = { ...opts, usage: { tomtom: 0, transitous: 0 } };
+  const result = await (isCarFirst(req.firstLeg) ? planCarFirst(req, ctx) : planStreetFirst(req, ctx));
+  return { ...result, usage: ctx.usage };
 }
 
-async function planStreetFirst(req: TripRequest, { trafficEnabled, signal, onProgress }: PlanOptions): Promise<PlanResult> {
+type PartialResult = Omit<PlanResult, 'usage'>;
+
+async function planStreetFirst(req: TripRequest, ctx: PlanContext): Promise<PartialResult> {
+  const { signal, onProgress } = ctx;
   const notes: string[] = [];
-  const driver = makeDriver(trafficEnabled, signal);
+  const driver = makeDriver(ctx);
   const params: PlanParams = {
     ...baseParams(req),
     preTransitModes: req.firstLeg,
@@ -620,13 +643,11 @@ async function planStreetFirst(req: TripRequest, { trafficEnabled, signal, onPro
   if (req.lastLeg === 'RIDESHARE') {
     onProgress?.('Checking rideshare times…');
     lastMile = await prepareRideshareLastMile(req, driver, notes, signal);
-    if (lastMile && driver.failed) notes.push(trafficNote(trafficEnabled));
+    if (lastMile && driver.failed) notes.push(driver.note);
   }
 
   onProgress?.('Planning…');
-  const res = lastMile
-    ? await api.planWithOffsets(params, { toOffsets: lastMile.offsets }, signal)
-    : await api.plan(params, signal);
+  const res = await planQuery(ctx, params, lastMile ? { toOffsets: lastMile.offsets } : undefined);
   const options = sortOptions(
     res.itineraries.map((it, i) => itineraryOption(req, it, `transit:${i}`, lastMile)),
     req.arriveBy,
@@ -636,26 +657,22 @@ async function planStreetFirst(req: TripRequest, { trafficEnabled, signal, onPro
   return { options, direct, notes };
 }
 
-async function planCarFirst(req: TripRequest, { trafficEnabled, signal, onProgress }: PlanOptions): Promise<PlanResult> {
+async function planCarFirst(req: TripRequest, ctx: PlanContext): Promise<PartialResult> {
+  const { trafficEnabled, signal, onProgress } = ctx;
   const notes: string[] = [];
   const base = baseParams(req);
   const maxKm = maxDriveKm(req.maxFirstLegMin);
-  const driver = makeDriver(trafficEnabled, signal);
+  const driver = makeDriver(ctx);
   const anchor = req.time ?? new Date();
 
   onProgress?.('Finding stations…');
   const [discovery, nearby, lastMile] = await Promise.all([
-    api
-      .plan(
-        {
-          ...base,
-          // Transitous has no rideshare mode; a drop-off has the same shape.
-          preTransitModes: req.firstLeg === 'RIDESHARE' ? 'CAR_DROPOFF' : req.firstLeg,
-          maxPreTransitTime: req.maxFirstLegMin * 60,
-        },
-        signal,
-      )
-      .catch((err) => {
+    planQuery(ctx, {
+      ...base,
+      // Transitous has no rideshare mode; a drop-off has the same shape.
+      preTransitModes: req.firstLeg === 'RIDESHARE' ? 'CAR_DROPOFF' : req.firstLeg,
+      maxPreTransitTime: req.maxFirstLegMin * 60,
+    }).catch((err) => {
         rethrowIfFatal(err, signal);
         return null;
       }),
@@ -683,7 +700,7 @@ async function planCarFirst(req: TripRequest, { trafficEnabled, signal, onProgre
     mapLimit(nearbyPicks, 4, (c) => driver.route(req.from, c.park, departureFor(c.estimateSec))),
     driver.route(req.from, req.to, departureFor(estimateDrive(req.from, req.to).seconds + waitSec)),
   ]);
-  if (driver.failed) notes.push(trafficNote(trafficEnabled));
+  if (driver.failed) notes.push(driver.note);
   const { keep, relaxed } = withinLimit(allDrives, req.maxFirstLegMin * 60, 2);
   if (relaxed) notes.push(`No station is within ${req.maxFirstLegMin} min by car right now; showing the closest.`);
   const candidates = keep.map((i) => nearbyPicks[i]);
@@ -694,11 +711,10 @@ async function planCarFirst(req: TripRequest, { trafficEnabled, signal, onProgre
   const options = await mapLimit(candidates, 3, async (c, i) => {
     const offsetSec = drives[i].seconds + bufferSec + c.walkSec;
     try {
-      const plan = await api.planWithOffsets(
-        base,
-        { fromOffsets: [{ stopId: c.stopId, duration: offsetSec, mode: 'CAR' }], toOffsets: lastMile?.offsets },
-        signal,
-      );
+      const plan = await planQuery(ctx, base, {
+        fromOffsets: [{ stopId: c.stopId, duration: offsetSec, mode: 'CAR' }],
+        toOffsets: lastMile?.offsets,
+      });
       return buildParkRideOption(req, c, drives[i], offsetSec, plan, lastMile);
     } catch (err) {
       rethrowIfFatal(err, signal);

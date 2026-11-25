@@ -7,3 +7,18 @@ compatibility_date = "2025-09-01"
 #   TOMTOM_API_KEY   TomTom Routing API key (traffic-aware drive times)
 #   TRANSITOUS_CONTACT  your email or URL, sent to Transitous in the User-Agent
 # For local dev, copy .dev.vars.example to .dev.vars.
+
+# Free-tier limits shown in the usage footer. TomTom calls stop at the monthly limit
+# (drive times fall back to estimates); the Transitous figure is a guideline and is only shown.
+[vars]
+TOMTOM_MONTHLY_LIMIT = "20000"
+TRANSITOUS_DAILY_LIMIT = "720"
+
+# Usage tracking (optional). Create the database with
+#   npx wrangler d1 create multimodalnav-usage
+# then uncomment this block and paste in the database_id it prints. The table is created
+# automatically on first use.
+# [[d1_databases]]
+# binding = "USAGE_DB"
+# database_name = "multimodalnav-usage"
+# database_id = "<DATABASE_ID>"
