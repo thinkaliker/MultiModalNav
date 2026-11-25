@@ -19,6 +19,7 @@
     maxFirstLegMin: 30,
     maxLastLegMin: 15,
     parkBufferMin: 5,
+    rideshareWaitMin: 6,
     stationsToCompare: 6,
   };
 

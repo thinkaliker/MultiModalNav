@@ -51,9 +51,15 @@
     <input type="range" min="5" max="60" step="5" bind:value={settings.maxFirstLegMin} />
   </label>
   <label>
-    <span>Max last leg: {settings.maxLastLegMin} min</span>
+    <span>Max {settings.lastLeg === 'RIDESHARE' ? 'rideshare' : 'last leg'}: {settings.maxLastLegMin} min</span>
     <input type="range" min="5" max="45" step="5" bind:value={settings.maxLastLegMin} />
   </label>
+  {#if settings.firstLeg === 'RIDESHARE' || settings.lastLeg === 'RIDESHARE'}
+    <label>
+      <span>Rideshare pickup wait: {settings.rideshareWaitMin} min</span>
+      <input type="range" min="0" max="20" step="1" bind:value={settings.rideshareWaitMin} />
+    </label>
+  {/if}
   {#if isCarFirst(settings.firstLeg)}
     {#if settings.firstLeg === 'CAR_PARKING'}
       <label>

@@ -110,9 +110,9 @@ export interface NamedPlace extends LatLon {
   name: string;
 }
 
-export type FirstLeg = 'CAR_PARKING' | 'CAR_DROPOFF' | 'BIKE' | 'WALK';
+export type FirstLeg = 'CAR_PARKING' | 'CAR_DROPOFF' | 'RIDESHARE' | 'BIKE' | 'WALK';
 export type TransitChoice = 'LIGHT_RAIL' | 'SUBWAY' | 'TRAIN' | 'BUS' | 'FERRY';
-export type LastLeg = 'WALK' | 'BIKE' | 'RENTAL';
+export type LastLeg = 'WALK' | 'BIKE' | 'RENTAL' | 'RIDESHARE';
 
 export interface TripSettings {
   firstLeg: FirstLeg;
@@ -121,6 +121,7 @@ export interface TripSettings {
   maxFirstLegMin: number;
   maxLastLegMin: number;
   parkBufferMin: number;
+  rideshareWaitMin: number;
   stationsToCompare: number;
 }
 
@@ -133,7 +134,7 @@ export interface TripRequest extends TripSettings {
 }
 
 export interface DisplayLeg {
-  mode: string; // MOTIS mode, or 'PARK' for the park-and-walk-to-platform step
+  mode: string; // MOTIS mode, or one of the app's own: 'PARK', 'WAIT', 'RIDESHARE'
   label: string;
   startTime: string;
   endTime: string;
@@ -170,6 +171,6 @@ export interface TripOption {
   station?: NamedPlace;
   /** Later/earlier departures from the same station (start/end times only). */
   alternatives: { startTime: string; endTime: string }[];
-  traffic?: { driveSec: number; delaySec: number; estimated: boolean };
+  traffic?: { label: 'Drive' | 'Ride'; driveSec: number; delaySec: number; estimated: boolean };
   realTime: boolean;
 }

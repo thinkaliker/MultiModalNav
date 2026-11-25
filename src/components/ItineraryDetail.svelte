@@ -22,7 +22,9 @@
       <li style:--leg-color={leg.color} class:dashed={leg.dashed}>
         <div class="time">{fmtTime(leg.startTime, leg.tz ?? tz)}</div>
         <div class="body">
-          <div class="place">{leg.from.name}</div>
+          {#if i === 0 || leg.from.name !== option.legs[i - 1].from.name}
+            <div class="place">{leg.from.name}</div>
+          {/if}
           <div class="leg">
             <span class="icon">{modeIcon(leg.mode)}</span>
             {#if leg.routeShortName}
@@ -42,7 +44,7 @@
             {#if leg.cancelled}<span class="cancelled">cancelled</span>{/if}
           </div>
           {#if leg.trafficEstimated}
-            <div class="traffic">Estimated drive time (no traffic data)</div>
+            <div class="traffic">Estimated time (no traffic data)</div>
           {:else if leg.trafficDelaySec !== undefined && leg.trafficDelaySec >= 60}
             <div class="traffic warn">Includes {fmtDuration(leg.trafficDelaySec)} of traffic delay</div>
           {/if}

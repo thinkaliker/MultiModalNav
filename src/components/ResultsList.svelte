@@ -33,9 +33,9 @@
       {#if opt.traffic}
         <div class="traffic" class:warn={opt.traffic.delaySec >= 300}>
           {#if opt.traffic.estimated}
-            Drive ~{fmtDuration(opt.traffic.driveSec)} (estimate, no traffic data)
+            {opt.traffic.label} ~{fmtDuration(opt.traffic.driveSec)} (estimate, no traffic data)
           {:else}
-            Drive {fmtDuration(opt.traffic.driveSec)}{opt.traffic.delaySec >= 60 ? ` incl. ${fmtDuration(opt.traffic.delaySec)} traffic delay` : ', light traffic'}
+            {opt.traffic.label} {fmtDuration(opt.traffic.driveSec)}{opt.traffic.delaySec >= 60 ? ` incl. ${fmtDuration(opt.traffic.delaySec)} traffic delay` : ', light traffic'}
           {/if}
         </div>
       {/if}

@@ -1,10 +1,12 @@
 import { api, AuthError, type DriveTiming, type PlanParams } from './api';
+import { fmtDuration } from './format';
 import { fmtLatLon, haversineKm, tileCenter, tileHalfDiagonalKm } from './geo';
 import { isCarFirst, modeColor, modeTextColor, motisTransitModes, STREET_MODES } from './modes';
 import { decodePolyline } from './polyline';
 import { stationsNear } from './stations';
 import type {
   DisplayLeg,
+  PlanOffset,
   LatLon,
   MotisItinerary,
   MotisLeg,
@@ -21,7 +23,9 @@ const DRIVE_KMH = 40;
 const TRANSIT_KMH = 30;
 const ROAD_FACTOR = 1.3;
 const TRANSIT_FACTOR = 1.25;
-const DROPOFF_BUFFER_SEC = 60;
+// Getting out of a car at the curb and walking to (or from) the platform.
+const CURB_SEC = 60;
+const MAX_RIDESHARE_STATIONS = 4;
 const CORRIDOR_BANDS = 3;
 
 export interface Candidate {
@@ -183,13 +187,30 @@ export function estimateDrive(from: LatLon, to: LatLon): Drive {
   };
 }
 
+/**
+ * Indexes of drives within `limitSec`. If none fit (heavy traffic, say), keep the `fallback`
+ * shortest ones so there's still something to compare; `relaxed` says that happened.
+ */
+export function withinLimit(drives: Drive[], limitSec: number, fallback = 1): { keep: number[]; relaxed: boolean } {
+  const keep = drives.flatMap((d, i) => (d.seconds <= limitSec ? [i] : []));
+  if (keep.length) return { keep, relaxed: false };
+  const shortest = drives
+    .map((d, i) => [d.seconds, i] as const)
+    .sort((a, b) => a[0] - b[0])
+    .slice(0, fallback)
+    .map(([, i]) => i);
+  return { keep: shortest, relaxed: true };
+}
+
 /** TomTom wants an RFC 3339 time in the future, or "now". */
-export function driveTiming(time: Date | null, arriveBy: boolean, estimatedTripSec: number, now = Date.now()): DriveTiming {
-  if (!time) return { departAt: 'now' };
-  const departure = arriveBy ? new Date(time.getTime() - estimatedTripSec * 1000) : time;
+export function driveTiming(departure: Date, now = Date.now()): DriveTiming {
   if (departure.getTime() <= now + 60_000) return { departAt: 'now' };
   return { departAt: departure.toISOString().replace(/\.\d{3}Z$/, '+00:00') };
 }
+
+const addSec = (date: Date, sec: number) => new Date(date.getTime() + sec * 1000);
+const iso = (msSinceEpoch: number) => new Date(msSinceEpoch).toISOString();
+const ms = (time: string) => Date.parse(time);
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length);
@@ -246,7 +267,83 @@ export function toDisplayLeg(leg: MotisLeg, req: TripRequest): DisplayLeg {
   };
 }
 
-const ms = (iso: string) => Date.parse(iso);
+/** A leg with no transit details: waiting, parking, driving, riding. */
+function streetLeg(
+  mode: string,
+  label: string,
+  start: number,
+  end: number,
+  from: NamedPlace,
+  to: NamedPlace,
+  extra: Partial<DisplayLeg> = {},
+): DisplayLeg {
+  return {
+    mode,
+    label,
+    startTime: iso(start),
+    endTime: iso(end),
+    durationSec: Math.round((end - start) / 1000),
+    from,
+    to,
+    coords: [],
+    color: modeColor(mode),
+    textColor: '#ffffff',
+    dashed: mode === 'WAIT' || mode === 'PARK',
+    realTime: false,
+    ...extra,
+  };
+}
+
+function driveExtras(drive: Drive): Partial<DisplayLeg> {
+  return {
+    coords: drive.coords,
+    distanceM: drive.distanceM,
+    trafficDelaySec: drive.delaySec,
+    trafficEstimated: drive.estimated,
+  };
+}
+
+/** Rideshare from the last transit stop: computed by the app and passed to Transitous as `toOffsets`. */
+export interface LastMile {
+  candidates: Candidate[];
+  drives: Drive[];
+  waitSec: number;
+  offsets: PlanOffset[];
+}
+
+function rideshareLastLegs(leg: MotisLeg, req: TripRequest, lastMile: LastMile): DisplayLeg[] {
+  const key = leg.from.parentId ?? leg.from.stopId;
+  let index = lastMile.candidates.findIndex((c) => c.key === key || c.stopId === leg.from.stopId);
+  if (index < 0) {
+    // Fall back to the closest candidate if Transitous reports a child stop we didn't send.
+    const dist = lastMile.candidates.map((c) => haversineKm(c.station, leg.from));
+    index = dist.indexOf(Math.min(...dist));
+  }
+  const station = lastMile.candidates[index];
+  const drive = lastMile.drives[index];
+  const end = ms(leg.endTime);
+  const rideStart = end - drive.seconds * 1000;
+  const stationPlace: NamedPlace = { name: station.name, ...station.station };
+  return [
+    streetLeg('WAIT', 'Walk to the pickup spot and wait for your ride', ms(leg.startTime), rideStart, stationPlace, stationPlace, {
+      tz: leg.from.tz,
+    }),
+    streetLeg('RIDESHARE', `Rideshare to ${req.to.name}`, rideStart, end, stationPlace, req.to, {
+      tz: leg.from.tz,
+      ...driveExtras(drive),
+    }),
+  ];
+}
+
+/** Convert Transitous legs, swapping its placeholder for a rideshare last mile if one was injected. */
+export function displayLegs(legs: MotisLeg[], req: TripRequest, lastMile?: LastMile): DisplayLeg[] {
+  return legs.flatMap((leg, i) =>
+    // Callers strip any first-mile car leg, so a trailing CAR leg here is always the injected one.
+    lastMile && i === legs.length - 1 && leg.mode === 'CAR'
+      ? rideshareLastLegs(leg, req, lastMile)
+      : [toDisplayLeg(leg, req)],
+  );
+}
 
 function sortItineraries(its: MotisItinerary[], arriveBy: boolean): MotisItinerary[] {
   return [...its].sort((a, b) =>
@@ -279,12 +376,25 @@ function alternativesOf(sorted: MotisItinerary[]): TripOption['alternatives'] {
     .map((it) => ({ startTime: it.startTime, endTime: it.endTime }));
 }
 
+const rideshareWaitSec = (req: TripRequest) => req.rideshareWaitMin * 60;
+
+/** Everything between leaving the start and the platform, beyond the drive itself. */
+export function firstLegBufferSec(req: TripRequest): number {
+  if (req.firstLeg === 'CAR_PARKING') return req.parkBufferMin * 60;
+  if (req.firstLeg === 'RIDESHARE') return rideshareWaitSec(req) + CURB_SEC;
+  return CURB_SEC;
+}
+
+const FIRST_LEG_TITLE: Record<string, string> = { CAR_PARKING: 'Park at', CAR_DROPOFF: 'Drop-off at', RIDESHARE: 'Rideshare to' };
+const FIRST_LEG_VERB: Record<string, string> = { CAR_PARKING: 'Drive to', CAR_DROPOFF: 'Get dropped off at', RIDESHARE: 'Rideshare to' };
+
 export function buildParkRideOption(
   req: TripRequest,
   candidate: Candidate,
   drive: Drive,
   offsetSec: number,
   plan: PlanResponse,
+  lastMile?: LastMile,
 ): TripOption | null {
   const its = sortItineraries(
     plan.itineraries.filter((it) => it.legs.length > 1 && it.legs[0].mode === 'CAR'),
@@ -294,58 +404,40 @@ export function buildParkRideOption(
   if (!best) return null;
 
   const [carLeg, ...rest] = best.legs;
-  const driveEnd = new Date(ms(carLeg.startTime) + drive.seconds * 1000).toISOString();
-  const dropoff = req.firstLeg === 'CAR_DROPOFF';
-  const legs: DisplayLeg[] = [
-    {
-      mode: 'CAR',
-      label: `${dropoff ? 'Get dropped off at' : 'Drive to'} ${candidate.name}`,
-      startTime: carLeg.startTime,
-      endTime: driveEnd,
-      durationSec: drive.seconds,
-      from: req.from,
-      to: { name: candidate.name, ...candidate.park },
-      tz: rest[0]?.from.tz,
-      coords: drive.coords,
-      color: modeColor('CAR'),
-      textColor: '#ffffff',
-      dashed: false,
-      realTime: false,
-      distanceM: drive.distanceM,
-      trafficDelaySec: drive.delaySec,
-      trafficEstimated: drive.estimated,
-    },
-  ];
-  if (!dropoff) {
-    const parkToStationKm = haversineKm(candidate.park, candidate.station);
-    legs.push({
-      mode: 'PARK',
-      label: 'Park and walk to the platform',
-      startTime: driveEnd,
-      endTime: carLeg.endTime,
-      durationSec: offsetSec - drive.seconds,
-      from: { name: 'Parking', ...candidate.park },
-      to: { name: candidate.name, ...candidate.station },
-      tz: rest[0]?.from.tz,
-      coords:
-        parkToStationKm > 0.02
-          ? [
-              [candidate.park.lon, candidate.park.lat],
-              [candidate.station.lon, candidate.station.lat],
-            ]
-          : [],
-      color: modeColor('PARK'),
-      textColor: '#ffffff',
-      dashed: true,
-      realTime: false,
-    });
+  const tz = rest[0]?.from.tz;
+  const waitSec = req.firstLeg === 'RIDESHARE' ? rideshareWaitSec(req) : 0;
+  const driveStart = ms(carLeg.startTime) + waitSec * 1000;
+  const driveEnd = driveStart + drive.seconds * 1000;
+  const dropPoint: NamedPlace = { name: candidate.name, ...candidate.park };
+  const legs: DisplayLeg[] = [];
+  if (waitSec) legs.push(streetLeg('WAIT', 'Wait for your ride', ms(carLeg.startTime), driveStart, req.from, req.from, { tz }));
+  legs.push(
+    streetLeg(req.firstLeg === 'RIDESHARE' ? 'RIDESHARE' : 'CAR', `${FIRST_LEG_VERB[req.firstLeg] ?? 'Drive to'} ${candidate.name}`, driveStart, driveEnd, req.from, dropPoint, {
+      tz,
+      ...driveExtras(drive),
+    }),
+  );
+  if (req.firstLeg === 'CAR_PARKING') {
+    const walkPath: [number, number][] =
+      haversineKm(candidate.park, candidate.station) > 0.02
+        ? [
+            [candidate.park.lon, candidate.park.lat],
+            [candidate.station.lon, candidate.station.lat],
+          ]
+        : [];
+    legs.push(
+      streetLeg('PARK', 'Park and walk to the platform', driveEnd, ms(carLeg.endTime), { ...dropPoint, name: 'Parking' }, {
+        name: candidate.name,
+        ...candidate.station,
+      }, { tz, coords: walkPath }),
+    );
   }
-  legs.push(...rest.map((l) => toDisplayLeg(l, req)));
+  legs.push(...displayLegs(rest, req, lastMile));
 
   return {
     id: `parkride:${candidate.key}`,
     kind: 'parkride',
-    title: `${dropoff ? 'Drop-off at' : 'Park at'} ${candidate.name}`,
+    title: `${FIRST_LEG_TITLE[req.firstLeg] ?? 'Via'} ${candidate.name}`,
     startTime: best.startTime,
     endTime: best.endTime,
     durationSec: best.duration,
@@ -353,13 +445,18 @@ export function buildParkRideOption(
     legs,
     station: { name: candidate.name, ...candidate.station },
     alternatives: alternativesOf(its),
-    traffic: { driveSec: drive.seconds, delaySec: drive.delaySec, estimated: drive.estimated },
+    traffic: {
+      label: req.firstLeg === 'RIDESHARE' ? 'Ride' : 'Drive',
+      driveSec: drive.seconds,
+      delaySec: drive.delaySec,
+      estimated: drive.estimated,
+    },
     realTime: legs.some((l) => l.realTime),
   };
 }
 
-export function itineraryOption(req: TripRequest, it: MotisItinerary, id: string): TripOption {
-  const legs = it.legs.map((l) => toDisplayLeg(l, req));
+export function itineraryOption(req: TripRequest, it: MotisItinerary, id: string, lastMile?: LastMile): TripOption {
+  const legs = displayLegs(it.legs, req, lastMile);
   const board = it.legs.find((l) => !STREET_MODES.has(l.mode));
   return {
     id,
@@ -376,39 +473,30 @@ export function itineraryOption(req: TripRequest, it: MotisItinerary, id: string
   };
 }
 
-function directDriveOption(req: TripRequest, drive: Drive): TripOption {
-  const anchor = req.time ?? new Date();
-  const start = req.arriveBy ? new Date(anchor.getTime() - drive.seconds * 1000) : anchor;
-  const end = new Date(start.getTime() + drive.seconds * 1000);
+function directCarOption(req: TripRequest, drive: Drive): TripOption {
+  const rideshare = req.firstLeg === 'RIDESHARE';
+  const waitSec = rideshare ? rideshareWaitSec(req) : 0;
+  const totalSec = waitSec + drive.seconds;
+  const anchor = (req.time ?? new Date()).getTime();
+  const start = req.arriveBy ? anchor - totalSec * 1000 : anchor;
+  const driveStart = start + waitSec * 1000;
+  const end = start + totalSec * 1000;
+  const legs: DisplayLeg[] = [];
+  if (waitSec) legs.push(streetLeg('WAIT', 'Wait for your ride', start, driveStart, req.from, req.from));
+  legs.push(
+    streetLeg(rideshare ? 'RIDESHARE' : 'CAR', `${rideshare ? 'Rideshare' : 'Drive'} to ${req.to.name}`, driveStart, end, req.from, req.to, driveExtras(drive)),
+  );
   return {
-    id: 'direct:drive',
+    id: 'direct:car',
     kind: 'direct',
-    title: 'Drive the whole way',
-    startTime: start.toISOString(),
-    endTime: end.toISOString(),
-    durationSec: drive.seconds,
+    title: rideshare ? 'Rideshare the whole way' : 'Drive the whole way',
+    startTime: iso(start),
+    endTime: iso(end),
+    durationSec: totalSec,
     transfers: 0,
-    legs: [
-      {
-        mode: 'CAR',
-        label: `Drive to ${req.to.name}`,
-        startTime: start.toISOString(),
-        endTime: end.toISOString(),
-        durationSec: drive.seconds,
-        from: req.from,
-        to: req.to,
-        coords: drive.coords,
-        color: modeColor('CAR'),
-        textColor: '#ffffff',
-        dashed: false,
-        realTime: false,
-        distanceM: drive.distanceM,
-        trafficDelaySec: drive.delaySec,
-        trafficEstimated: drive.estimated,
-      },
-    ],
+    legs,
     alternatives: [],
-    traffic: { driveSec: drive.seconds, delaySec: drive.delaySec, estimated: drive.estimated },
+    traffic: { label: rideshare ? 'Ride' : 'Drive', driveSec: drive.seconds, delaySec: drive.delaySec, estimated: drive.estimated },
     realTime: false,
   };
 }
@@ -420,7 +508,8 @@ function baseParams(req: TripRequest): PlanParams {
     time: (req.time ?? new Date()).toISOString(),
     arriveBy: req.arriveBy,
     transitModes: motisTransitModes(req.transit).join(','),
-    postTransitModes: req.lastLeg,
+    // A rideshare last mile is sent as toOffsets, which replace this.
+    postTransitModes: req.lastLeg === 'RIDESHARE' ? 'WALK' : req.lastLeg,
     maxPostTransitTime: req.maxLastLegMin * 60,
   };
 }
@@ -435,27 +524,115 @@ function rethrowIfFatal(err: unknown, signal?: AbortSignal) {
   if (err instanceof AuthError || signal?.aborted) throw err;
 }
 
+/** Traffic-aware drives via TomTom, falling back to estimates once a lookup fails. */
+function makeDriver(trafficEnabled: boolean, signal?: AbortSignal) {
+  let failed = !trafficEnabled;
+  return {
+    get failed() {
+      return failed;
+    },
+    async route(from: LatLon, to: LatLon, departure: Date): Promise<Drive> {
+      if (!failed) {
+        try {
+          const res = await api.trafficRoute(from, to, driveTiming(departure), signal);
+          if (res.routes?.length) return driveFromTomTom(res);
+        } catch (err) {
+          rethrowIfFatal(err, signal);
+          failed = true;
+        }
+      }
+      return estimateDrive(from, to);
+    },
+  };
+}
+
+type Driver = ReturnType<typeof makeDriver>;
+
+function trafficNote(trafficEnabled: boolean): string {
+  return trafficEnabled
+    ? 'Traffic lookup failed for some legs; those car times are estimates.'
+    : 'Traffic is not configured (TOMTOM_API_KEY); car times are rough estimates.';
+}
+
+/** Stations near the destination, each with a traffic-aware rideshare time to it. */
+async function prepareRideshareLastMile(
+  req: TripRequest,
+  driver: Driver,
+  notes: string[],
+  signal?: AbortSignal,
+): Promise<LastMile | undefined> {
+  const maxKm = maxDriveKm(req.maxLastLegMin);
+  const nearby = await stationsNear(req.to, maxKm, motisTransitModes(req.transit), (tile) =>
+    inCorridor(req.to, req.from, tileCenter(tile), 2 * tileHalfDiagonalKm(tile)),
+  ).catch((err) => {
+    rethrowIfFatal(err, signal);
+    return [] as MotisPlace[];
+  });
+  // Same ranking as for the first leg, seen from the destination's side.
+  const candidates = pickCandidates(nearby, [], req.to, req.from, maxKm, Math.min(req.stationsToCompare, MAX_RIDESHARE_STATIONS));
+  if (!candidates.length) {
+    notes.push(`No stations within about ${req.maxLastLegMin} minutes’ ride of the destination; showing a walking last leg instead.`);
+    return undefined;
+  }
+  const anchor = req.time ?? new Date();
+  const waitSec = rideshareWaitSec(req);
+  const drives = await mapLimit(candidates, 4, (c) => {
+    const rideSec = estimateDrive(c.station, req.to).seconds;
+    const departure = req.arriveBy
+      ? addSec(anchor, -rideSec - waitSec)
+      : addSec(anchor, c.estimateSec - rideSec); // rough time spent getting to this station
+    return driver.route(c.station, req.to, departure);
+  });
+  const { keep, relaxed } = withinLimit(drives, req.maxLastLegMin * 60);
+  if (relaxed) {
+    notes.push(
+      `No station is within ${req.maxLastLegMin} min by rideshare; using the closest (${fmtDuration(drives[keep[0]].seconds)}).`,
+    );
+  }
+  const kept = keep.map((i) => ({ candidate: candidates[i], drive: drives[i] }));
+  return {
+    candidates: kept.map((k) => k.candidate),
+    drives: kept.map((k) => k.drive),
+    waitSec,
+    offsets: kept.map(({ candidate, drive }) => ({
+      stopId: candidate.stopId,
+      duration: CURB_SEC + waitSec + drive.seconds,
+      mode: 'CAR' as const,
+    })),
+  };
+}
+
 export async function planTrip(req: TripRequest, opts: PlanOptions): Promise<PlanResult> {
   return isCarFirst(req.firstLeg) ? planCarFirst(req, opts) : planStreetFirst(req, opts);
 }
 
-async function planStreetFirst(req: TripRequest, { signal, onProgress }: PlanOptions): Promise<PlanResult> {
+async function planStreetFirst(req: TripRequest, { trafficEnabled, signal, onProgress }: PlanOptions): Promise<PlanResult> {
+  const notes: string[] = [];
+  const driver = makeDriver(trafficEnabled, signal);
+  const params: PlanParams = {
+    ...baseParams(req),
+    preTransitModes: req.firstLeg,
+    maxPreTransitTime: req.maxFirstLegMin * 60,
+    directModes: req.firstLeg,
+  };
+
+  let lastMile: LastMile | undefined;
+  if (req.lastLeg === 'RIDESHARE') {
+    onProgress?.('Checking rideshare times…');
+    lastMile = await prepareRideshareLastMile(req, driver, notes, signal);
+    if (lastMile && driver.failed) notes.push(trafficNote(trafficEnabled));
+  }
+
   onProgress?.('Planning…');
-  const res = await api.plan(
-    {
-      ...baseParams(req),
-      preTransitModes: req.firstLeg,
-      maxPreTransitTime: req.maxFirstLegMin * 60,
-      directModes: req.firstLeg,
-    },
-    signal,
-  );
+  const res = lastMile
+    ? await api.planWithOffsets(params, { toOffsets: lastMile.offsets }, signal)
+    : await api.plan(params, signal);
   const options = sortOptions(
-    res.itineraries.map((it, i) => itineraryOption(req, it, `transit:${i}`)),
+    res.itineraries.map((it, i) => itineraryOption(req, it, `transit:${i}`, lastMile)),
     req.arriveBy,
   ).slice(0, 8);
   const direct = res.direct[0] ? itineraryOption(req, res.direct[0], 'direct:street') : undefined;
-  const notes = options.length ? [] : ['No transit connections found. Try more transit modes or a longer first/last leg.'];
+  if (!options.length) notes.push('No transit connections found. Try more transit modes or a longer first/last leg.');
   return { options, direct, notes };
 }
 
@@ -463,11 +640,21 @@ async function planCarFirst(req: TripRequest, { trafficEnabled, signal, onProgre
   const notes: string[] = [];
   const base = baseParams(req);
   const maxKm = maxDriveKm(req.maxFirstLegMin);
+  const driver = makeDriver(trafficEnabled, signal);
+  const anchor = req.time ?? new Date();
 
   onProgress?.('Finding stations…');
-  const [discovery, nearby] = await Promise.all([
+  const [discovery, nearby, lastMile] = await Promise.all([
     api
-      .plan({ ...base, preTransitModes: req.firstLeg, maxPreTransitTime: req.maxFirstLegMin * 60 }, signal)
+      .plan(
+        {
+          ...base,
+          // Transitous has no rideshare mode; a drop-off has the same shape.
+          preTransitModes: req.firstLeg === 'RIDESHARE' ? 'CAR_DROPOFF' : req.firstLeg,
+          maxPreTransitTime: req.maxFirstLegMin * 60,
+        },
+        signal,
+      )
       .catch((err) => {
         rethrowIfFatal(err, signal);
         return null;
@@ -479,47 +666,40 @@ async function planCarFirst(req: TripRequest, { trafficEnabled, signal, onProgre
       notes.push('Could not load the station list; only Transitous’s own pick is shown.');
       return [] as MotisPlace[];
     }),
+    req.lastLeg === 'RIDESHARE' ? prepareRideshareLastMile(req, driver, notes, signal) : Promise.resolve(undefined),
   ]);
   const discovered = discovery ? discoveryCandidates(discovery, req.from, req.to) : [];
-  const candidates = pickCandidates(nearby, discovered, req.from, req.to, maxKm, req.stationsToCompare);
-  if (!candidates.length) {
+  const nearbyPicks = pickCandidates(nearby, discovered, req.from, req.to, maxKm, req.stationsToCompare);
+  if (!nearbyPicks.length) {
     notes.push(`No stations found within about ${req.maxFirstLegMin} minutes’ drive for the selected transit modes.`);
     return { options: [], notes };
   }
 
-  onProgress?.(trafficEnabled ? `Checking traffic to ${candidates.length} stations…` : 'Estimating drive times…');
-  let trafficFailed = !trafficEnabled;
-  const drive = async (to: LatLon, estimatedTripSec: number): Promise<Drive> => {
-    if (!trafficFailed) {
-      try {
-        const res = await api.trafficRoute(req.from, to, driveTiming(req.time, req.arriveBy, estimatedTripSec), signal);
-        if (res.routes?.length) return driveFromTomTom(res);
-      } catch (err) {
-        rethrowIfFatal(err, signal);
-        trafficFailed = true;
-      }
-    }
-    return estimateDrive(req.from, to);
-  };
-  const [drives, directDrive] = await Promise.all([
-    mapLimit(candidates, 4, (c) => drive(c.park, c.estimateSec)),
-    drive(req.to, estimateDrive(req.from, req.to).seconds),
+  onProgress?.(trafficEnabled ? `Checking traffic to ${nearbyPicks.length} stations…` : 'Estimating drive times…');
+  const waitSec = req.firstLeg === 'RIDESHARE' ? rideshareWaitSec(req) : 0;
+  const departureFor = (estimatedTripSec: number) =>
+    req.arriveBy ? addSec(anchor, -estimatedTripSec) : addSec(anchor, waitSec);
+  const [allDrives, directDrive] = await Promise.all([
+    mapLimit(nearbyPicks, 4, (c) => driver.route(req.from, c.park, departureFor(c.estimateSec))),
+    driver.route(req.from, req.to, departureFor(estimateDrive(req.from, req.to).seconds + waitSec)),
   ]);
-  if (trafficFailed) {
-    notes.push(
-      trafficEnabled
-        ? 'Traffic lookup failed for some stations; those drive times are estimates.'
-        : 'Traffic is not configured (TOMTOM_API_KEY); drive times are rough estimates.',
-    );
-  }
+  if (driver.failed) notes.push(trafficNote(trafficEnabled));
+  const { keep, relaxed } = withinLimit(allDrives, req.maxFirstLegMin * 60, 2);
+  if (relaxed) notes.push(`No station is within ${req.maxFirstLegMin} min by car right now; showing the closest.`);
+  const candidates = keep.map((i) => nearbyPicks[i]);
+  const drives = keep.map((i) => allDrives[i]);
 
   onProgress?.(`Planning transit from ${candidates.length} stations…`);
-  const bufferSec = req.firstLeg === 'CAR_DROPOFF' ? DROPOFF_BUFFER_SEC : req.parkBufferMin * 60;
+  const bufferSec = firstLegBufferSec(req);
   const options = await mapLimit(candidates, 3, async (c, i) => {
     const offsetSec = drives[i].seconds + bufferSec + c.walkSec;
     try {
-      const plan = await api.planWithOffsets(base, [{ stopId: c.stopId, duration: offsetSec, mode: 'CAR' }], signal);
-      return buildParkRideOption(req, c, drives[i], offsetSec, plan);
+      const plan = await api.planWithOffsets(
+        base,
+        { fromOffsets: [{ stopId: c.stopId, duration: offsetSec, mode: 'CAR' }], toOffsets: lastMile?.offsets },
+        signal,
+      );
+      return buildParkRideOption(req, c, drives[i], offsetSec, plan, lastMile);
     } catch (err) {
       rethrowIfFatal(err, signal);
       return null;
@@ -530,5 +710,5 @@ async function planCarFirst(req: TripRequest, { trafficEnabled, signal, onProgre
   if (found.length < candidates.length) {
     notes.push(`${candidates.length - found.length} of ${candidates.length} stations had no connection in the search window.`);
   }
-  return { options: sortOptions(found, req.arriveBy), direct: directDriveOption(req, directDrive), notes };
+  return { options: sortOptions(found, req.arriveBy), direct: directCarOption(req, directDrive), notes };
 }

@@ -2,7 +2,8 @@ import type { FirstLeg, LastLeg, TransitChoice } from './types';
 
 export const FIRST_LEG_OPTIONS: { id: FirstLeg; label: string; icon: string }[] = [
   { id: 'CAR_PARKING', label: 'Drive & park', icon: '🚗' },
-  { id: 'CAR_DROPOFF', label: 'Drop-off', icon: '🚕' },
+  { id: 'CAR_DROPOFF', label: 'Drop-off', icon: '🚘' },
+  { id: 'RIDESHARE', label: 'Rideshare', icon: '🚕' },
   { id: 'BIKE', label: 'Bike', icon: '🚲' },
   { id: 'WALK', label: 'Walk', icon: '🚶' },
 ];
@@ -24,19 +25,34 @@ export const LAST_LEG_OPTIONS: { id: LastLeg; label: string; icon: string }[] = 
   { id: 'WALK', label: 'Walk', icon: '🚶' },
   { id: 'BIKE', label: 'Own bike', icon: '🚲' },
   { id: 'RENTAL', label: 'Bike/scooter share', icon: '🛴' },
+  { id: 'RIDESHARE', label: 'Rideshare', icon: '🚕' },
 ];
 
 export function motisTransitModes(choices: TransitChoice[]): string[] {
   return TRANSIT_OPTIONS.filter((o) => choices.includes(o.id)).flatMap((o) => o.modes);
 }
 
-export const isCarFirst = (first: FirstLeg) => first === 'CAR_PARKING' || first === 'CAR_DROPOFF';
+export const isCarFirst = (first: FirstLeg) => first === 'CAR_PARKING' || first === 'CAR_DROPOFF' || first === 'RIDESHARE';
 
-export const STREET_MODES = new Set(['WALK', 'BIKE', 'RENTAL', 'CAR', 'CAR_PARKING', 'CAR_DROPOFF', 'FLEX', 'ODM', 'PARK']);
+export const STREET_MODES = new Set([
+  'WALK',
+  'BIKE',
+  'RENTAL',
+  'CAR',
+  'CAR_PARKING',
+  'CAR_DROPOFF',
+  'FLEX',
+  'ODM',
+  'PARK',
+  'WAIT',
+  'RIDESHARE',
+]);
 
 const MODE_STYLE: Record<string, { color: string; icon: string }> = {
   CAR: { color: '#475569', icon: '🚗' },
   PARK: { color: '#64748b', icon: '🅿️' },
+  WAIT: { color: '#94a3b8', icon: '⏱️' },
+  RIDESHARE: { color: '#9333ea', icon: '🚕' },
   WALK: { color: '#6b7280', icon: '🚶' },
   BIKE: { color: '#16a34a', icon: '🚲' },
   RENTAL: { color: '#0d9488', icon: '🛴' },

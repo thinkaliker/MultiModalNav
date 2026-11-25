@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  withinLimit,
   buildParkRideOption,
+  displayLegs,
+  firstLegBufferSec,
   discoveryCandidates,
   driveFromTomTom,
   driveTiming,
@@ -42,6 +45,7 @@ const request: TripRequest = {
   maxFirstLegMin: 30,
   maxLastLegMin: 15,
   parkBufferMin: 5,
+  rideshareWaitMin: 6,
   stationsToCompare: 6,
 };
 
@@ -124,17 +128,13 @@ describe('pickCandidates', () => {
 describe('driveTiming', () => {
   const now = Date.parse('2026-12-01T15:00:00Z');
 
-  it('uses "now" for immediate departures', () => {
-    expect(driveTiming(null, false, 0, now)).toEqual({ departAt: 'now' });
-    expect(driveTiming(new Date(now + 30_000), false, 0, now)).toEqual({ departAt: 'now' });
+  it('uses "now" for past or imminent departures', () => {
+    expect(driveTiming(new Date(now - 600_000), now)).toEqual({ departAt: 'now' });
+    expect(driveTiming(new Date(now + 30_000), now)).toEqual({ departAt: 'now' });
   });
 
   it('formats future departures for TomTom', () => {
-    expect(driveTiming(new Date('2026-12-01T16:00:00Z'), false, 0, now)).toEqual({ departAt: '2026-12-01T16:00:00+00:00' });
-  });
-
-  it('backs arrive-by times off by the estimated trip length', () => {
-    expect(driveTiming(new Date('2026-12-01T17:00:00Z'), true, 3600, now)).toEqual({ departAt: '2026-12-01T16:00:00+00:00' });
+    expect(driveTiming(new Date('2026-12-01T16:00:00Z'), now)).toEqual({ departAt: '2026-12-01T16:00:00+00:00' });
   });
 });
 
@@ -206,7 +206,7 @@ describe('buildParkRideOption', () => {
     expect(option.legs[1].durationSec).toBe(420);
     expect(option.legs[2].to.name).toBe('Work');
     expect(option.legs[2].color).toBe('#FDB913');
-    expect(option.traffic).toEqual({ driveSec: 2700, delaySec: 900, estimated: false });
+    expect(option.traffic).toEqual({ label: 'Drive', driveSec: 2700, delaySec: 900, estimated: false });
   });
 
   it('returns null when no connection was found', () => {
@@ -219,5 +219,103 @@ describe('inCorridor', () => {
     const { inCorridor } = await import('../src/lib/planner');
     expect(inCorridor(torrance, santaMonica, expoBundy)).toBe(true);
     expect(inCorridor(torrance, santaMonica, { lat: 33.6, lon: -118.1 })).toBe(false);
+  });
+});
+
+describe('rideshare', () => {
+  const bundyStation = { lat: 34.0315, lon: -118.4529 };
+  const candidate = {
+    key: 'bundy',
+    stopId: 'bundy',
+    name: 'Expo / Bundy Station',
+    station: bundyStation,
+    park: bundyStation,
+    walkSec: 0,
+    source: 'nearby' as const,
+    estimateSec: 3000,
+  };
+  const drive = { seconds: 1800, delaySec: 300, distanceM: 20000, coords: [] as [number, number][], estimated: false };
+
+  it('adds the pickup wait to a rideshare first leg', () => {
+    const rideshareReq = { ...request, firstLeg: 'RIDESHARE' as const };
+    expect(firstLegBufferSec(rideshareReq)).toBe(6 * 60 + 60);
+    expect(firstLegBufferSec(request)).toBe(5 * 60);
+
+    const offsetSec = drive.seconds + firstLegBufferSec(rideshareReq);
+    const start = '2026-12-01T16:00:00Z';
+    const atStation = new Date(Date.parse(start) + offsetSec * 1000).toISOString();
+    const plan: PlanResponse = {
+      direct: [],
+      itineraries: [
+        {
+          duration: 3600,
+          startTime: start,
+          endTime: '2026-12-01T17:00:00Z',
+          transfers: 0,
+          legs: [
+            leg({ mode: 'CAR', from: place('START', torrance), to: place('Expo / Bundy Station', bundyStation), startTime: start, endTime: atStation }),
+            leg({ mode: 'TRAM', from: place('Expo / Bundy Station', bundyStation), to: place('END', santaMonica), startTime: '2026-12-01T16:45:00Z', endTime: '2026-12-01T17:00:00Z', routeShortName: 'E' }),
+          ],
+        },
+      ],
+    };
+    const option = buildParkRideOption(rideshareReq, candidate, drive, offsetSec, plan)!;
+    expect(option.title).toBe('Rideshare to Expo / Bundy Station');
+    expect(option.legs.map((l) => [l.mode, l.durationSec])).toEqual([
+      ['WAIT', 360],
+      ['RIDESHARE', 1800],
+      ['TRAM', 900],
+    ]);
+    expect(option.traffic?.label).toBe('Ride');
+  });
+
+  it('turns the injected last-mile leg into a wait and a ride', () => {
+    const lastMile = {
+      candidates: [candidate],
+      drives: [drive],
+      waitSec: 360,
+      offsets: [{ stopId: 'bundy', duration: 60 + 360 + 1800, mode: 'CAR' as const }],
+    };
+    const legs = displayLegs(
+      [
+        leg({ mode: 'TRAM', from: place('Redondo Beach Station', torrance), to: place('Expo / Bundy Station', bundyStation), startTime: '2026-12-01T16:00:00Z', endTime: '2026-12-01T16:50:00Z', routeShortName: 'K' }),
+        leg({
+          mode: 'CAR',
+          from: place('Expo / Bundy Station', bundyStation, { stopId: 'bundy-platform', parentId: 'bundy' }),
+          to: place('END', santaMonica),
+          startTime: '2026-12-01T16:50:00Z',
+          endTime: '2026-12-01T17:27:00Z',
+        }),
+      ],
+      { ...request, lastLeg: 'RIDESHARE' },
+      lastMile,
+    );
+    expect(legs.map((l) => [l.mode, l.durationSec])).toEqual([
+      ['TRAM', 3000],
+      ['WAIT', 420],
+      ['RIDESHARE', 1800],
+    ]);
+    expect(legs[2].to.name).toBe('Work');
+    expect(legs[2].trafficDelaySec).toBe(300);
+  });
+
+  it('leaves trips without an injected last mile alone', () => {
+    const legs = displayLegs(
+      [leg({ mode: 'WALK', from: place('Station', bundyStation), to: place('END', santaMonica), startTime: '2026-12-01T16:50:00Z', endTime: '2026-12-01T17:00:00Z' })],
+      request,
+    );
+    expect(legs.map((l) => l.mode)).toEqual(['WALK']);
+  });
+});
+
+describe('withinLimit', () => {
+  const d = (seconds: number) => ({ seconds, delaySec: 0, distanceM: 0, coords: [] as [number, number][], estimated: false });
+
+  it('keeps only drives within the limit', () => {
+    expect(withinLimit([d(600), d(2400), d(1200)], 1800)).toEqual({ keep: [0, 2], relaxed: false });
+  });
+
+  it('falls back to the shortest drives when none fit', () => {
+    expect(withinLimit([d(4000), d(2400), d(3000)], 1800, 2)).toEqual({ keep: [1, 2], relaxed: true });
   });
 });

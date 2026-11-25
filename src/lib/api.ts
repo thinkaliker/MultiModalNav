@@ -73,11 +73,16 @@ export const api = {
   plan: (params: PlanParams, signal?: AbortSignal) =>
     request<PlanResponse>(`/api/transit/v6/plan?${qs(params)}`, { signal }),
 
-  planWithOffsets: (params: PlanParams, fromOffsets: PlanOffset[], signal?: AbortSignal) =>
+  /** Plan with client-computed first and/or last miles, which replace Transitous's own. */
+  planWithOffsets: (
+    params: PlanParams,
+    offsets: { fromOffsets?: PlanOffset[]; toOffsets?: PlanOffset[] },
+    signal?: AbortSignal,
+  ) =>
     request<PlanResponse>(`/api/transit/v6/plan?${qs(params)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fromOffsets }),
+      body: JSON.stringify(offsets),
       signal,
     }),
 
