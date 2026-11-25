@@ -31,14 +31,24 @@ With several modes selected, each first/last pairing is planned separately, beca
 
 **Free tier use per drive-first search** (default 6 stations): about 7 TomTom routes (11 with a rideshare last leg) and 7 Transitous queries, plus station lists, which are cached for a week. Each extra first/last pairing adds up to 6 Transitous queries for a car first leg, or 1 for walk or bike. The app shows an estimate under **Find routes** before you search. TomTom's free 20,000 routes a month works out to roughly 1,800 to 2,800 single-mode searches. Transitous asks to be contacted above about 720 plan queries a day, which is roughly 100 searches.
 
-### Usage tracking
+### Usage tracking and rate limits
 
-After you sign in, the footer shows TomTom routes used this month and Transitous plan queries used today, next to their free-tier limits. The numbers turn amber at 80% and red at the limit. Each set of results also says how many calls that search made.
+After you sign in, the footer shows TomTom routes used this month and Transitous plan queries used today, next to their free-tier limits. The numbers turn amber at 80% and red at the limit. Each set of results also says how many calls that search made, and an estimate appears under **Find routes** before you search.
 
-- Counts are kept in an optional [D1](https://developers.cloudflare.com/d1/) database. They only include this app's calls, and periods are UTC months and days. TomTom's own dashboard is the authoritative figure.
-- **TomTom calls stop at the monthly limit.** The server refuses them without calling TomTom, and drive times fall back to estimates until the next month. This keeps you inside the free tier.
-- **Transitous is only shown, never blocked.** Its daily figure is a guideline for when to contact them, not a hard limit.
-- Without the database, nothing is counted or limited, and the footer says tracking is off.
+The server also rate-limits upstream calls across **all** connected clients, so several people searching at once don't trip TomTom's or Transitous's "too many requests" limits:
+
+| Limit | Default | When exceeded |
+| --- | --- | --- |
+| TomTom routes per month (`TOMTOM_MONTHLY_LIMIT`) | 20,000 | TomTom isn't called; drive times fall back to estimates until next month |
+| Transitous plan queries per day (`TRANSITOUS_DAILY_LIMIT`) | 720 | Shown only; it's a guideline for when to contact Transitous, not a hard limit |
+| TomTom requests per second, all clients (`TOMTOM_MAX_PER_SECOND`) | 4 | The request waits for the next free second (up to 8 s), then gets HTTP 503 |
+| Transitous requests per second, all clients (`TRANSITOUS_MAX_PER_SECOND`) | 4 | Same as above. Station-list tiles are exempt: they're mostly served from Cloudflare's cache |
+| Requests per minute from one device (`CLIENT_MAX_PER_MINUTE`) | 120 | HTTP 429 with a `Retry-After`, so one runaway client can't starve the others |
+
+- Counters live in the optional `USAGE_DB` database (see setup below). D1 is strongly consistent, so every request on every Cloudflare server sees the same counts. Without the database, nothing is counted or limited server-side, the footer says tracking is off, and only each browser tab's own limit applies (3 Transitous and 2 TomTom requests at a time).
+- Counts only include this app's calls, and periods are UTC months and days. TomTom's own dashboard is the authoritative figure.
+- If the database itself fails, requests go ahead rather than failing.
+- Devices are told apart by IP address (`CF-Connecting-IP`), so people on the same network share a per-device budget. A heavy multi-mode search makes about 60 upstream calls.
 
 ## Setup
 
@@ -61,22 +71,55 @@ npm test         # unit tests
 npm run check    # type-check the app and the Functions
 ```
 
-### 3. Usage tracking database (optional)
+### 3. Usage database (`USAGE_DB`, optional but recommended)
+
+This is a free [D1](https://developers.cloudflare.com/d1/) database that turns on usage tracking, the TomTom monthly stop, and the shared rate limits. The free tier (100,000 writes a day) is plenty: each upstream call costs about 3 writes. Because `wrangler.toml` is the source of truth for this project, the binding has to go in that file; the dashboard's Bindings page will be read-only. The database id is just an identifier, not a secret, so it's fine to commit.
+
+**Option A: from the command line** (on your own machine)
 
 ```sh
-npx wrangler d1 create multimodalnav-usage
+npx wrangler login     # opens a browser to authorize Wrangler with your Cloudflare account
+npx wrangler d1 create multimodalnav-usage --location wnam --binding USAGE_DB --update-config
 ```
 
-Uncomment the `[[d1_databases]]` block in `wrangler.toml`, paste in the `database_id` the command printed, and commit it. The id isn't secret. The table is created on first use. To change the limits, edit `TOMTOM_MONTHLY_LIMIT` and `TRANSITOUS_DAILY_LIMIT` under `[vars]` in `wrangler.toml`.
+That creates the database (`wnam` = Western North America, close to Southern California) and appends a block like this to `wrangler.toml`:
 
-Locally, `npx wrangler pages dev --d1 USAGE_DB=usage-local` gives you a throwaway local database without editing `wrangler.toml`.
+```toml
+[[d1_databases]]
+binding = "USAGE_DB"
+database_name = "multimodalnav-usage"
+database_id = "…"
+```
+
+**Option B: from the dashboard**
+
+1. Go to **Storage & Databases → D1 SQL database → Create database**.
+2. Name it `multimodalnav-usage`, pick a location near you, and create it.
+3. Copy the **Database ID** from the database's page.
+4. In `wrangler.toml`, uncomment the `[[d1_databases]]` block at the bottom and replace `<DATABASE_ID>` with that id.
+
+**Then, either way:**
+
+1. Commit and push `wrangler.toml`. The Pages build picks up the binding. The tables are created automatically on the first request, so there's nothing else to set up.
+2. Check it: sign in, and the footer should read "Usage: TomTom 0 / 20,000 routes this month · …" instead of "Usage tracking is off". To look at the raw counters:
+   ```sh
+   npx wrangler d1 execute multimodalnav-usage --remote --command "SELECT * FROM usage"
+   ```
+3. To change any limit, edit its value under `[vars]` in `wrangler.toml` and push.
+
+**Locally**, once the block is in `wrangler.toml`, `npm run dev` uses a local SQLite copy automatically; your production counts aren't touched. Before then, `npx wrangler pages dev --d1 USAGE_DB=usage-local` gives you a throwaway local database.
+
+If a deploy fails with an error about the D1 binding, the `database_id` in `wrangler.toml` doesn't match a database in your account. Re-copy it from the dashboard.
 
 ### 4. Deploy to Cloudflare Pages
 
-**Git integration:** in the Cloudflare dashboard, go to Workers & Pages → Create → Pages → Connect to Git and pick this repo.
+**Git integration:** in the Cloudflare dashboard, go to **Workers & Pages → Create application → Pages → Connect to Git** and pick this repo. Make sure it's a **Pages** project: the default "Create" flow makes a Worker, which asks for a deploy command and won't work with this repo.
 
+- Project name: `multimodalnav` (must match `name` in `wrangler.toml`)
+- Framework preset: None
 - Build command: `npm run build`
 - Build output directory: `dist`
+- Root directory: leave blank
 - Under Settings → Variables and Secrets, add `APP_PASSWORD`, `TOMTOM_API_KEY` and `TRANSITOUS_CONTACT` as **secrets**. Because the repo has a `wrangler.toml`, Cloudflare treats that file as the source of truth for plain-text variables and won't let you edit them in the dashboard. Secrets are still set in the dashboard, and they also keep your contact details out of the public repo.
 
 **Or from the CLI:**
@@ -98,7 +141,10 @@ npm run deploy
 | `TRANSITOUS_CONTACT` | recommended | Your email or a URL, sent to Transitous in the User-Agent (`MultiModalNav/<version> (+<repo>; <contact>)`) as its usage policy asks |
 | `TOMTOM_MONTHLY_LIMIT` | no (in `wrangler.toml`) | TomTom routes per month before calls stop; default 20000 |
 | `TRANSITOUS_DAILY_LIMIT` | no (in `wrangler.toml`) | Transitous plan queries per day shown in the footer; default 720 |
-| `USAGE_DB` | no (D1 binding) | Turns on usage tracking and the TomTom limit |
+| `TOMTOM_MAX_PER_SECOND` | no (in `wrangler.toml`) | TomTom requests per second across all clients; default 4 |
+| `TRANSITOUS_MAX_PER_SECOND` | no (in `wrangler.toml`) | Transitous requests per second across all clients; default 4 |
+| `CLIENT_MAX_PER_MINUTE` | no (in `wrangler.toml`) | Upstream requests per minute from one device; default 120 |
+| `USAGE_DB` | recommended (D1 binding) | Turns on usage tracking, the TomTom monthly stop and the shared rate limits |
 
 The first three are **secrets**: set them in the dashboard or with `wrangler pages secret put`, and never put them in `wrangler.toml`, which is public.
 

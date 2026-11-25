@@ -642,7 +642,7 @@ function makeDriver({ trafficEnabled, signal, usage }: PlanOptions & { usage: Se
       rethrowIfFatal(err, signal);
       anyFailed = true;
       lastError = (err as Error).message;
-      if (err instanceof ApiError && err.status === 429) {
+      if (err instanceof ApiError && err.status === 429 && err.message === 'monthly_limit_reached') {
         // The server refuses without calling TomTom once the monthly limit is reached.
         limitReached = true;
         disabled = true;

@@ -1,6 +1,6 @@
-import type { UsageEnv } from './usage';
+import type { RateEnv } from './ratelimit';
 
-export interface Env extends UsageEnv {
+export interface Env extends RateEnv {
   APP_PASSWORD?: string;
   TOMTOM_API_KEY?: string;
   /** Contact (email or URL) sent to Transitous in the User-Agent, as its usage policy asks. */

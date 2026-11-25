@@ -1,4 +1,5 @@
 import { json, type Env } from '../../_lib/env';
+import { guardUpstream } from '../../_lib/ratelimit';
 import { limitFor, recordUse } from '../../_lib/usage';
 
 // Traffic-aware car route via the TomTom Routing API. The API key never leaves the server.
@@ -17,13 +18,16 @@ function validTime(value: string | null): value is string {
   return value !== null && !Number.isNaN(Date.parse(value));
 }
 
-export const onRequestGet: PagesFunction<Env> = async ({ request, env }) => {
+export const onRequestGet: PagesFunction<Env> = async ({ request, env, waitUntil }) => {
   if (!env.TOMTOM_API_KEY) return json({ error: 'traffic_unconfigured' }, 503);
 
   const q = new URL(request.url).searchParams;
   const from = q.get('from');
   const to = q.get('to');
   if (!validCoord(from) || !validCoord(to)) return json({ error: 'from/to must be "lat,lon"' }, 400);
+
+  const limited = await guardUpstream(env, request, 'tomtom', waitUntil);
+  if (limited) return limited;
 
   if (env.USAGE_DB) {
     // A broken tracker shouldn't break routing, so fail open.

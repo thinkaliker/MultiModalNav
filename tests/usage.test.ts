@@ -1,22 +1,6 @@
-import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
-import { limitFor, periodKey, readUsage, recordUse, type UsageDb, type UsageStatement } from '../functions/_lib/usage';
-
-/** Minimal D1 stand-in over an in-memory SQLite database. */
-function sqliteDb(): UsageDb {
-  const db = new DatabaseSync(':memory:');
-  const statement = (sql: string, args: unknown[] = []): UsageStatement & { all(): Promise<{ results: unknown[] }> } => ({
-    bind: (...values) => statement(sql, values),
-    run: async () => db.prepare(sql).run(...(args as never[])),
-    first: async <T>() => (db.prepare(sql).get(...(args as never[])) as T | undefined) ?? null,
-    all: async () => ({ results: db.prepare(sql).all(...(args as never[])) }),
-  });
-  return {
-    prepare: (sql) => statement(sql),
-    batch: async <T>(stmts: UsageStatement[]) =>
-      Promise.all(stmts.map((s) => (s as ReturnType<typeof statement>).all())) as Promise<{ results: T[] }[]>,
-  };
-}
+import { limitFor, periodKey, readUsage, recordUse } from '../functions/_lib/usage';
+import { sqliteDb } from './sqlite';
 
 const now = new Date('2026-11-25T20:00:00Z');
 

@@ -13,11 +13,17 @@ compatibility_date = "2025-09-01"
 [vars]
 TOMTOM_MONTHLY_LIMIT = "20000"
 TRANSITOUS_DAILY_LIMIT = "720"
+# Shared across all clients (needs USAGE_DB): upstream requests per second per service, and
+# requests per minute from any one device.
+TOMTOM_MAX_PER_SECOND = "4"
+TRANSITOUS_MAX_PER_SECOND = "4"
+CLIENT_MAX_PER_MINUTE = "120"
 
-# Usage tracking (optional). Create the database with
-#   npx wrangler d1 create multimodalnav-usage
-# then uncomment this block and paste in the database_id it prints. The table is created
-# automatically on first use.
+# Usage tracking and shared rate limits (optional; see "Usage database" in the README).
+# Either run
+#   npx wrangler d1 create multimodalnav-usage --location wnam --binding USAGE_DB --update-config
+# which appends the block for you, or create the database in the dashboard, then uncomment
+# this block and paste in its Database ID. Tables are created automatically on first use.
 # [[d1_databases]]
 # binding = "USAGE_DB"
 # database_name = "multimodalnav-usage"

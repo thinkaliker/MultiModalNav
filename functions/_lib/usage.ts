@@ -53,14 +53,20 @@ export function limitFor(env: UsageEnv, metric: Metric): number {
 
 const schemas = new WeakMap<UsageDb, Promise<unknown>>();
 
-function ensureSchema(db: UsageDb): Promise<unknown> {
+/** Create the tables on first use, once per database. */
+export function ensureSchema(db: UsageDb): Promise<unknown> {
   let ready = schemas.get(db);
   if (!ready) {
     ready = db
-      .prepare(
-        'CREATE TABLE IF NOT EXISTS usage (period TEXT NOT NULL, metric TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (period, metric))',
-      )
-      .run()
+      .batch([
+        db.prepare(
+          'CREATE TABLE IF NOT EXISTS usage (period TEXT NOT NULL, metric TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (period, metric))',
+        ),
+        // Rate-limit windows (see ratelimit.ts); old rows are pruned as they expire.
+        db.prepare(
+          'CREATE TABLE IF NOT EXISTS rate (key TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (key, window_start))',
+        ),
+      ])
       .catch((err) => {
         schemas.delete(db);
         throw err;

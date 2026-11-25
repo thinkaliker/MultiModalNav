@@ -1,4 +1,5 @@
 import { json, type Env } from '../../_lib/env';
+import { guardUpstream } from '../../_lib/ratelimit';
 import { recordUse } from '../../_lib/usage';
 import { userAgent } from '../../_lib/useragent';
 
@@ -10,14 +11,16 @@ const UPSTREAM = 'https://api.transitous.org/api/';
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_RETRIES = 2;
 
-// path -> methods allowed, edge cache TTL (seconds, 0 = don't cache), and whether it counts
-// toward Transitous's daily guideline (which covers /plan, /one-to-many and /one-to-all).
-const ROUTES: Record<string, { methods: string[]; ttl: number; counted?: boolean }> = {
-  'v6/plan': { methods: ['GET', 'POST'], ttl: 0, counted: true },
-  'v6/stoptimes': { methods: ['GET'], ttl: 0 },
-  'v6/trip': { methods: ['GET'], ttl: 0 },
-  'v1/geocode': { methods: ['GET'], ttl: 3600 },
-  'v1/reverse-geocode': { methods: ['GET'], ttl: 3600 },
+// path -> methods allowed, edge cache TTL (seconds, 0 = don't cache), whether it counts toward
+// Transitous's daily guideline (which covers /plan, /one-to-many and /one-to-all), and whether
+// it goes through the shared rate limit. Station tiles skip it: they come in bursts on a new
+// search and are mostly served from the edge cache.
+const ROUTES: Record<string, { methods: string[]; ttl: number; counted?: boolean; limited?: boolean }> = {
+  'v6/plan': { methods: ['GET', 'POST'], ttl: 0, counted: true, limited: true },
+  'v6/stoptimes': { methods: ['GET'], ttl: 0, limited: true },
+  'v6/trip': { methods: ['GET'], ttl: 0, limited: true },
+  'v1/geocode': { methods: ['GET'], ttl: 3600, limited: true },
+  'v1/reverse-geocode': { methods: ['GET'], ttl: 3600, limited: true },
   'v6/map/stops': { methods: ['GET'], ttl: 86400 },
   'experimental/map/routes': { methods: ['GET'], ttl: 86400 },
 };
@@ -45,6 +48,10 @@ export const onRequest: PagesFunction<Env, 'path'> = async ({ request, params, e
     init.cf = { cacheTtl: route.ttl, cacheEverything: true };
   }
 
+  if (route.limited) {
+    const limited = await guardUpstream(env, request, 'transitous', waitUntil);
+    if (limited) return limited;
+  }
   if (route.counted && env.USAGE_DB) waitUntil(recordUse(env.USAGE_DB, 'transitous.plan').catch(() => {}));
 
   let upstream = await fetch(url.toString(), init);
