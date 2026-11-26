@@ -101,6 +101,15 @@ export async function recordUse(db: UsageDb, metric: Metric, limit?: number, now
   return row !== null;
 }
 
+/** Take back one use that turned out not to happen (e.g. the request was rate-limited). */
+export async function undoUse(db: UsageDb, metric: Metric, now = new Date()): Promise<void> {
+  await ensureSchema(db);
+  await db
+    .prepare('UPDATE usage SET count = count - 1 WHERE period = ?1 AND metric = ?2 AND count > 0')
+    .bind(periodKey(METRICS[metric].window, now), metric)
+    .run();
+}
+
 export async function readUsage(db: UsageDb, env: UsageEnv, now = new Date()): Promise<Record<Metric, Meter>> {
   await ensureSchema(db);
   const metrics = Object.keys(METRICS) as Metric[];

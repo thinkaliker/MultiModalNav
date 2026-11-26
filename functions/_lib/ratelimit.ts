@@ -2,7 +2,7 @@
 // consistent, so all requests see the same counts). Without the database nothing is limited
 // here; each browser tab still limits its own concurrency.
 
-import { json } from './env';
+import { rejected } from './upstream-common';
 import { ensureSchema, type UsageDb, type UsageEnv } from './usage';
 
 export interface RateEnv extends UsageEnv {
@@ -11,7 +11,8 @@ export interface RateEnv extends UsageEnv {
   CLIENT_MAX_PER_MINUTE?: string;
 }
 
-export type Service = 'tomtom' | 'transitous';
+export type { Service } from './upstream-common';
+import type { Service } from './upstream-common';
 
 const DEFAULTS = { tomtom: 4, transitous: 4, clientPerMinute: 120 };
 const MAX_WAIT_MS = 8000;
@@ -89,9 +90,7 @@ export async function guardUpstream(
     const perMinute = positive(env.CLIENT_MAX_PER_MINUTE, DEFAULTS.clientPerMinute);
     if (!(await take(db, `client:${client}`, 60_000, perMinute, now))) {
       const retryAfter = Math.ceil((60_000 - (now % 60_000)) / 1000);
-      return json({ error: `Too many requests from this device; try again in ${retryAfter} s` }, 429, {
-        'Retry-After': String(retryAfter),
-      });
+      return rejected(429, `Too many requests from this device; try again in ${retryAfter} s`, retryAfter);
     }
 
     const perSecond = positive(
@@ -99,7 +98,7 @@ export async function guardUpstream(
       DEFAULTS[service],
     );
     if (!(await waitForSlot(db, `service:${service}`, perSecond, MAX_WAIT_MS, clock))) {
-      return json({ error: 'Server busy; try again shortly' }, 503, { 'Retry-After': '2' });
+      return rejected(503, 'Server busy; try again shortly', 2);
     }
     return null;
   } catch {

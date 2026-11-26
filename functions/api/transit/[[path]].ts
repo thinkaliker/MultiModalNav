@@ -1,5 +1,6 @@
 import { json, type Env } from '../../_lib/env';
-import { guardUpstream } from '../../_lib/ratelimit';
+import { callUpstream } from '../../_lib/upstream';
+import { fetchWithRetry, type CacheOptions } from '../../_lib/upstream-common';
 import { recordUse } from '../../_lib/usage';
 import { userAgent } from '../../_lib/useragent';
 
@@ -9,7 +10,6 @@ import { userAgent } from '../../_lib/useragent';
 
 const UPSTREAM = 'https://api.transitous.org/api/';
 const MAX_BODY_BYTES = 64 * 1024;
-const MAX_RETRIES = 2;
 
 // path -> methods allowed, edge cache TTL (seconds, 0 = don't cache), whether it counts toward
 // Transitous's daily guideline (which covers /plan, /one-to-many and /one-to-all), and whether
@@ -35,35 +35,39 @@ export const onRequest: PagesFunction<Env, 'path'> = async ({ request, params, e
   const url = new URL(UPSTREAM + path);
   url.search = new URL(request.url).search;
 
-  const init: RequestInit<RequestInitCfProperties> = {
-    method: request.method,
-    headers: { 'User-Agent': userAgent(env.TRANSITOUS_CONTACT), Accept: 'application/json' },
-  };
+  const headers: Record<string, string> = { 'User-Agent': userAgent(env.TRANSITOUS_CONTACT), Accept: 'application/json' };
+  let body: string | undefined;
+  let cf: CacheOptions | undefined;
   if (request.method === 'POST') {
-    const body = await request.arrayBuffer();
-    if (body.byteLength > MAX_BODY_BYTES) return json({ error: 'body too large' }, 413);
-    init.body = body;
-    (init.headers as Record<string, string>)['Content-Type'] = 'application/json';
+    body = await request.text();
+    if (body.length > MAX_BODY_BYTES) return json({ error: 'body too large' }, 413);
+    headers['Content-Type'] = 'application/json';
   } else if (route.ttl > 0) {
-    init.cf = { cacheTtl: route.ttl, cacheEverything: true };
+    cf = { cacheTtl: route.ttl, cacheEverything: true };
   }
 
+  let upstream: Response;
+  let via = 'direct';
   if (route.limited) {
-    const limited = await guardUpstream(env, request, 'transitous', waitUntil);
-    if (limited) return limited;
+    const result = await callUpstream(
+      env,
+      request,
+      { service: 'transitous', url: url.toString(), method: request.method, headers, body, cf },
+      waitUntil,
+    );
+    if (result.rejected) return result.response;
+    upstream = result.response;
+    via = result.via;
+  } else {
+    upstream = await fetchWithRetry(url.toString(), { method: request.method, headers, body, cf });
   }
   if (route.counted && env.USAGE_DB) waitUntil(recordUse(env.USAGE_DB, 'transitous.plan').catch(() => {}));
 
-  let upstream = await fetch(url.toString(), init);
-  // Transitous rate-limits bursts; back off briefly and retry (all allowed routes are read-only).
-  for (let attempt = 1; upstream.status === 429 && attempt <= MAX_RETRIES; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
-    upstream = await fetch(url.toString(), init);
-  }
-  const headers = new Headers({
+  const responseHeaders = new Headers({
     'Content-Type': upstream.headers.get('Content-Type') ?? 'application/json',
     'Cache-Control': route.ttl > 0 && upstream.ok ? `private, max-age=${route.ttl}` : 'no-store',
+    'X-Upstream-Via': via,
   });
   // 401 from upstream must not look like our own "signed out" response.
-  return new Response(upstream.body, { status: upstream.status === 401 ? 502 : upstream.status, headers });
+  return new Response(upstream.body, { status: upstream.status === 401 ? 502 : upstream.status, headers: responseHeaders });
 };

@@ -7,7 +7,7 @@
     "dev": "node -e \"require('fs').mkdirSync('dist',{recursive:true})\" && concurrently -k -n web,api -c blue,magenta \"vite\" \"wrangler pages dev --port 8788\"",
     "build": "vite build",
     "preview": "vite build && wrangler pages dev --port 8788",
-    "check": "svelte-check --tsconfig ./tsconfig.json && tsc -p functions/tsconfig.json --noEmit",
+    "check": "svelte-check --tsconfig ./tsconfig.json && tsc -p functions/tsconfig.json --noEmit && tsc -p gate/tsconfig.json --noEmit",
     "test": "vitest run",
     "deploy": "vite build && wrangler pages deploy"
   },

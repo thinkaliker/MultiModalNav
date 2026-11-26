@@ -1,0 +1,17 @@
+# The upstream request queue (a Durable Object). Deploy it once before enabling the GATE
+# binding in the main wrangler.toml; see "Request queue" in the README.
+name = "multimodalnav-gate"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+
+# Only reachable from the Pages project through its Durable Object binding.
+workers_dev = false
+preview_urls = false
+
+[[durable_objects.bindings]]
+name = "GATE"
+class_name = "UpstreamGate"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["UpstreamGate"]

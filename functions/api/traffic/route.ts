@@ -1,12 +1,11 @@
 import { json, type Env } from '../../_lib/env';
-import { guardUpstream } from '../../_lib/ratelimit';
-import { limitFor, recordUse } from '../../_lib/usage';
+import { callUpstream } from '../../_lib/upstream';
+import { limitFor, recordUse, undoUse } from '../../_lib/usage';
 
 // Traffic-aware car route via the TomTom Routing API. The API key never leaves the server.
 // GET /api/traffic/route?from=lat,lon&to=lat,lon[&departAt=ISO|now]
 
 const COORD = /^-?\d{1,2}(\.\d+)?,-?\d{1,3}(\.\d+)?$/;
-const MAX_RETRIES = 2;
 
 function validCoord(value: string | null): value is string {
   if (!value || !COORD.test(value)) return false;
@@ -26,9 +25,6 @@ export const onRequestGet: PagesFunction<Env> = async ({ request, env, waitUntil
   const to = q.get('to');
   if (!validCoord(from) || !validCoord(to)) return json({ error: 'from/to must be "lat,lon"' }, 400);
 
-  const limited = await guardUpstream(env, request, 'tomtom', waitUntil);
-  if (limited) return limited;
-
   if (env.USAGE_DB) {
     // A broken tracker shouldn't break routing, so fail open.
     const allowed = await recordUse(env.USAGE_DB, 'tomtom.route', limitFor(env, 'tomtom.route')).catch(() => true);
@@ -47,20 +43,30 @@ export const onRequestGet: PagesFunction<Env> = async ({ request, env, waitUntil
   if (departAt !== 'now' && !validTime(departAt)) return json({ error: 'bad departAt' }, 400);
   params.set('departAt', departAt);
 
-  const url = `https://api.tomtom.com/routing/1/calculateRoute/${from}:${to}/json?${params}`;
-  let upstream = await fetch(url, { headers: { Accept: 'application/json' } });
-  // TomTom's free tier caps requests per second; back off briefly and retry.
-  for (let attempt = 1; upstream.status === 429 && attempt <= MAX_RETRIES; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
-    upstream = await fetch(url, { headers: { Accept: 'application/json' } });
+  const { response: upstream, rejected, via } = await callUpstream(
+    env,
+    request,
+    {
+      service: 'tomtom',
+      url: `https://api.tomtom.com/routing/1/calculateRoute/${from}:${to}/json?${params}`,
+      headers: { Accept: 'application/json' },
+    },
+    waitUntil,
+  );
+  if (rejected) {
+    // The limiter turned it away, so TomTom was never called: don't count it.
+    if (env.USAGE_DB) waitUntil(undoUse(env.USAGE_DB, 'tomtom.route').catch(() => {}));
+    return upstream;
   }
   if (!upstream.ok) {
     // Don't pass TomTom's status through: the app reads 401 as "signed out" and 429 as our
     // monthly limit. 401/403 here usually means a wrong or disabled TomTom key.
-    return json({ error: `TomTom returned HTTP ${upstream.status}`, upstreamStatus: upstream.status }, 502);
+    return json({ error: `TomTom returned HTTP ${upstream.status}`, upstreamStatus: upstream.status }, 502, {
+      'X-Upstream-Via': via,
+    });
   }
   return new Response(upstream.body, {
     status: upstream.status,
-    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Upstream-Via': via },
   });
 };

@@ -35,20 +35,27 @@ With several modes selected, each first/last pairing is planned separately, beca
 
 After you sign in, the footer shows TomTom routes used this month and Transitous plan queries used today, next to their free-tier limits. The numbers turn amber at 80% and red at the limit. Each set of results also says how many calls that search made, and an estimate appears under **Find routes** before you search.
 
-The server also rate-limits upstream calls across **all** connected clients, so several people searching at once don't trip TomTom's or Transitous's "too many requests" limits:
+The server also limits upstream calls across **all** connected clients, so several people searching at once don't trip TomTom's or Transitous's "too many requests" limits. There are two ways it can do this:
+
+- **Request queue (recommended).** A small separate Worker (`gate/`) runs a single [Durable Object](https://developers.cloudflare.com/durable-objects/) that every TomTom and Transitous request passes through. It serves requests first come, first served, and only lets a few run at once. This matches how the upstream limits behave: they reject too many *simultaneous* requests. Requests wait in line instead of failing.
+- **Per-second limiter (fallback).** If the queue isn't deployed or can't be reached, the server counts requests started per second in the `USAGE_DB` database. It works, but slow queries can still pile up, because a Transitous query can take a few seconds.
 
 | Limit | Default | When exceeded |
 | --- | --- | --- |
 | TomTom routes per month (`TOMTOM_MONTHLY_LIMIT`) | 20,000 | TomTom isn't called; drive times fall back to estimates until next month |
 | Transitous plan queries per day (`TRANSITOUS_DAILY_LIMIT`) | 720 | Shown only; it's a guideline for when to contact Transitous, not a hard limit |
-| TomTom requests per second, all clients (`TOMTOM_MAX_PER_SECOND`) | 4 | The request waits for the next free second (up to 8 s), then gets HTTP 503 |
-| Transitous requests per second, all clients (`TRANSITOUS_MAX_PER_SECOND`) | 4 | Same as above. Station-list tiles are exempt: they're mostly served from Cloudflare's cache |
-| Requests per minute from one device (`CLIENT_MAX_PER_MINUTE`) | 120 | HTTP 429 with a `Retry-After`, so one runaway client can't starve the others |
+| TomTom requests in flight, all clients (`TOMTOM_MAX_IN_FLIGHT`, queue) | 2 | The request waits its turn (up to 15 s), then gets HTTP 503 |
+| Transitous requests in flight, all clients (`TRANSITOUS_MAX_IN_FLIGHT`, queue) | 3 | Same as above |
+| TomTom / Transitous requests per second (`TOMTOM_MAX_PER_SECOND`, `TRANSITOUS_MAX_PER_SECOND`, fallback) | 4 / 4 | The request waits for the next free second (up to 8 s), then gets HTTP 503 |
+| Requests per minute from one device (`CLIENT_MAX_PER_MINUTE`, both) | 120 | HTTP 429 with a `Retry-After`, so one runaway client can't starve the others |
 
-- Counters live in the optional `USAGE_DB` database (see setup below). D1 is strongly consistent, so every request on every Cloudflare server sees the same counts. Without the database, nothing is counted or limited server-side, the footer says tracking is off, and only each browser tab's own limit applies (3 Transitous and 2 TomTom requests at a time).
+- Station-list tiles skip these limits. They come in a burst at the start of a search and are mostly served from Cloudflare's cache.
+- Each API response carries an `X-Upstream-Via` header (`gate`, `limiter` or `direct`), so you can check in the browser's dev tools which path was used.
+- If the queue or the database fails, requests go ahead rather than failing. Gate failures are logged as `GATE unavailable` in the Pages Functions logs.
+- Usage counters (the footer) live in the optional `USAGE_DB` database (see setup below). Without it, nothing is counted, the monthly TomTom stop is off, and the fallback limiter is off too. The queue doesn't need it.
 - Counts only include this app's calls, and periods are UTC months and days. TomTom's own dashboard is the authoritative figure.
-- If the database itself fails, requests go ahead rather than failing.
 - Devices are told apart by IP address (`CF-Connecting-IP`), so people on the same network share a per-device budget. A heavy multi-mode search makes about 60 upstream calls.
+- Each browser tab also keeps itself to 3 Transitous and 2 TomTom requests at a time.
 
 ## Setup
 
@@ -111,7 +118,34 @@ database_id = "…"
 
 If a deploy fails with an error about the D1 binding, the `database_id` in `wrangler.toml` doesn't match a database in your account. Re-copy it from the dashboard.
 
-### 4. Deploy to Cloudflare Pages
+### 4. Request queue (`gate/`, optional but recommended)
+
+The queue is a separate Worker, because Pages projects can't host Durable Objects. It's on the free plan: Durable Objects allow 100,000 requests a day, and each upstream call is one request. Deploy it **before** turning on the binding, or the Pages deploy will fail.
+
+1. **Deploy the gate Worker.** Do this once now, and again whenever `gate/` or `functions/_lib/upstream-common.ts` changes. Either:
+   - **Let Cloudflare deploy it on every push:** go to **Workers & Pages → Create application → Workers → Import a repository**, then pick this repo.
+     - Project name: `multimodalnav-gate` (must match `name` in `gate/wrangler.toml`)
+     - Root directory: `gate`
+     - Build command: leave blank
+     - Deploy command: `npx wrangler deploy`
+   - **Or from your machine:**
+     ```sh
+     cd gate
+     npx wrangler deploy
+     ```
+   The Worker has no public URL (`workers_dev = false`); only the Pages project can reach it.
+2. **Turn on the binding:** in the main `wrangler.toml`, uncomment the `[[durable_objects.bindings]]` block at the bottom, then commit and push.
+3. **Check it:** run a search, then in the browser's dev tools open any `/api/transit/…` or `/api/traffic/…` response. It should have `X-Upstream-Via: gate`. `limiter` means the Pages project can't reach the queue; the Functions logs will say why.
+
+**Locally:** start the gate in a second terminal before `npm run dev`:
+
+```sh
+cd gate && npx wrangler dev --port 8787
+```
+
+The site finds it automatically through Wrangler's local registry. Without it running, local requests fall back to the per-second limiter.
+
+### 5. Deploy to Cloudflare Pages
 
 **Git integration:** in the Cloudflare dashboard, go to **Workers & Pages → Create application → Pages → Connect to Git** and pick this repo. Make sure it's a **Pages** project: the default "Create" flow makes a Worker, which asks for a deploy command and won't work with this repo.
 
@@ -143,8 +177,11 @@ npm run deploy
 | `TRANSITOUS_DAILY_LIMIT` | no (in `wrangler.toml`) | Transitous plan queries per day shown in the footer; default 720 |
 | `TOMTOM_MAX_PER_SECOND` | no (in `wrangler.toml`) | TomTom requests per second across all clients; default 4 |
 | `TRANSITOUS_MAX_PER_SECOND` | no (in `wrangler.toml`) | Transitous requests per second across all clients; default 4 |
+| `TOMTOM_MAX_IN_FLIGHT` | no (in `wrangler.toml`) | TomTom requests running at once, all clients, with the queue; default 2 |
+| `TRANSITOUS_MAX_IN_FLIGHT` | no (in `wrangler.toml`) | Transitous requests running at once, all clients, with the queue; default 3 |
 | `CLIENT_MAX_PER_MINUTE` | no (in `wrangler.toml`) | Upstream requests per minute from one device; default 120 |
-| `USAGE_DB` | recommended (D1 binding) | Turns on usage tracking, the TomTom monthly stop and the shared rate limits |
+| `USAGE_DB` | recommended (D1 binding) | Turns on usage tracking, the TomTom monthly stop and the fallback limiter |
+| `GATE` | recommended (Durable Object binding) | The request queue from `gate/`; see step 4 |
 
 The first three are **secrets**: set them in the dashboard or with `wrangler pages secret put`, and never put them in `wrangler.toml`, which is public.
 

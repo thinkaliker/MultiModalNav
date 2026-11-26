@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { limitFor, periodKey, readUsage, recordUse } from '../functions/_lib/usage';
+import { limitFor, periodKey, readUsage, recordUse, undoUse } from '../functions/_lib/usage';
 import { sqliteDb } from './sqlite';
 
 const now = new Date('2026-11-25T20:00:00Z');
@@ -36,5 +36,18 @@ describe('usage tracking', () => {
     expect((await readUsage(db, {}, now))['tomtom.route'].used).toBe(3);
     // A new month starts fresh.
     expect(await recordUse(db, 'tomtom.route', 3, new Date('2026-12-01T00:00:00Z'))).toBe(true);
+  });
+});
+
+describe('undoUse', () => {
+  it('takes back a use but never goes below zero', async () => {
+    const db = sqliteDb();
+    await recordUse(db, 'tomtom.route', 100, now);
+    await recordUse(db, 'tomtom.route', 100, now);
+    await undoUse(db, 'tomtom.route', now);
+    expect((await readUsage(db, {}, now))['tomtom.route'].used).toBe(1);
+    await undoUse(db, 'tomtom.route', now);
+    await undoUse(db, 'tomtom.route', now);
+    expect((await readUsage(db, {}, now))['tomtom.route'].used).toBe(0);
   });
 });
