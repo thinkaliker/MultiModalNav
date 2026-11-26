@@ -34,7 +34,7 @@ database_id = "cfd58432-b78a-4f88-9586-54e319b86b85"
 
 # Request queue shared by all clients (optional; see "Request queue" in the README).
 # Deploy the gate/ Worker first, then uncomment this block. Until then, the D1 limiter is used.
-# [[durable_objects.bindings]]
-# name = "GATE"
-# class_name = "UpstreamGate"
-# script_name = "multimodalnav-gate"
+[[durable_objects.bindings]]
+name = "GATE"
+class_name = "UpstreamGate"
+script_name = "multimodalnav-gate"
