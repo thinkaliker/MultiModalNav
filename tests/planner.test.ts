@@ -23,6 +23,8 @@ import {
   earlyExits,
   exitEarly,
   dropDominated,
+  revisitsStation,
+  slowerThanParkAndRideshare,
 } from '../src/lib/planner';
 import type { LegCombo, MotisItinerary, MotisLeg, MotisPlace, PlanResponse, TripOption, TripSettings } from '../src/lib/types';
 
@@ -360,10 +362,10 @@ describe('estimateCost', () => {
   it('grows with each first/last combination', () => {
     const combos = { ...base, firstLegs: ['CAR_PARKING', 'BIKE'], lastLegs: ['WALK', 'RIDESHARE'] } satisfies TripSettings;
     // Transitous: 1 discovery + 1 car mode x 2 last legs x 2 queries + 1 street mode x 2 last legs
-    // TomTom: 6 + 1, then 4 rideshare stations + 4 early-exit rides, then 4 park-and-rideshare drives
-    expect(estimateCost({ ...combos, minTransitStops: 1 }, true)).toEqual({ tomtom: 19, transitous: 7 });
+    // TomTom: 6 + 1, then 6 rideshare stations + 4 early-exit rides, then 6 park-and-rideshare drives
+    expect(estimateCost({ ...combos, minTransitStops: 1 }, true)).toEqual({ tomtom: 23, transitous: 7 });
     // A minimum ride allows a retry per car query, plus the bike query with a rideshare last leg.
-    expect(estimateCost(combos, true)).toEqual({ tomtom: 19, transitous: 12 });
+    expect(estimateCost(combos, true)).toEqual({ tomtom: 23, transitous: 12 });
   });
 });
 
@@ -562,5 +564,71 @@ describe('dropDominated', () => {
     const kept = dropDominated([option('late', '16:40', '17:20'), option('early', '16:20', '17:19')], true);
     // Leaving 20 minutes earlier for the same arrival is clearly worse.
     expect(kept.map((o) => o.id)).toEqual(['late']);
+  });
+});
+
+describe('revisitsStation', () => {
+  const t = (minute: number) => `2026-12-01T18:${String(minute).padStart(2, '0')}:00Z`;
+  const stop = (name: string, lat: number, parentId?: string) =>
+    place(name, { lat, lon: -117.1 }, { stopId: `${name}-1`, parentId: parentId ?? name });
+  const tram = (from: MotisPlace, to: MotisPlace, start: number, end: number, via: MotisPlace[] = []) =>
+    leg({ mode: 'TRAM', from, to, intermediateStops: via, startTime: t(start), endTime: t(end) });
+  const trip = (...legs: MotisLeg[]): MotisItinerary => ({ duration: 0, startTime: t(0), endTime: t(30), transfers: legs.length - 1, legs });
+
+  it('catches riding one stop out and back to the same station', () => {
+    // Fenton Parkway → Rio Vista, change, Rio Vista → Fenton Parkway (a different platform).
+    const loop = trip(tram(stop('fenton', 32.77), stop('riovista', 32.774), 0, 3), tram(stop('riovista', 32.774), stop('fenton-b', 32.77, 'fenton'), 8, 11));
+    expect(revisitsStation(loop)).toBe(true);
+  });
+
+  it('allows ordinary transfers', () => {
+    const ok = trip(
+      tram(stop('balboa', 32.8), stop('oldtown', 32.75), 0, 10, [stop('clairemont', 32.79), stop('tecolote', 32.77)]),
+      leg({ mode: 'WALK', from: stop('oldtown', 32.75), to: stop('oldtown-b', 32.75, 'oldtown'), startTime: t(10), endTime: t(12) }),
+      tram(stop('oldtown-b', 32.75, 'oldtown'), stop('riovista', 32.774), 14, 25, [stop('fashionvalley', 32.76)]),
+    );
+    expect(revisitsStation(ok)).toBe(false);
+  });
+});
+
+describe('slowerThanParkAndRideshare', () => {
+  const option = (durationMin: number, rideMin: number, driveMin = 21) =>
+    ({
+      durationSec: durationMin * 60,
+      traffic: { label: 'Drive', driveSec: driveMin * 60, delaySec: 0, estimated: false },
+      legs: rideMin ? [{ mode: 'TRAM', durationSec: 600 }, { mode: 'RIDESHARE', durationSec: rideMin * 60 }] : [{ mode: 'TRAM', durationSec: 600 }],
+    }) as unknown as TripOption;
+  // Park at Mission San Diego (22 min drive), rideshare 11 min.
+  const parkAndRideshare = option(40, 11, 22);
+
+  it('hides transit that only adds time before the same drive and rideshare', () => {
+    expect(slowerThanParkAndRideshare(option(75, 11), parkAndRideshare)).toBe(true);
+  });
+
+  it('keeps transit that saves rideshare or driving, or is about as fast', () => {
+    expect(slowerThanParkAndRideshare(option(75, 3), parkAndRideshare)).toBe(false);
+    expect(slowerThanParkAndRideshare(option(50, 11), parkAndRideshare)).toBe(false);
+    expect(slowerThanParkAndRideshare(option(75, 0), parkAndRideshare)).toBe(false);
+    // Parking downtown means a 32-minute drive instead of 21: that's what the trolley saves.
+    expect(slowerThanParkAndRideshare(option(75, 6), option(40, 5, 32))).toBe(false);
+  });
+});
+
+describe('pickCandidates closest', () => {
+  it('can take the stations nearest the start first', () => {
+    const near = (name: string, lat: number): MotisPlace => ({ name, stopId: name, lat, lon: -118.3406 });
+    // Seen from the destination's side: Santa Monica to Torrance, stations spread south.
+    const stations = [near('a', 34.0), near('b', 33.98), near('c', 33.9), near('d', 33.95)];
+    const picked = pickCandidates(stations, [], santaMonica, torrance, 30, 2, 2);
+    expect(picked.map((c) => c.name)).toEqual(['a', 'b']);
+  });
+});
+
+describe('pickCandidates spacing', () => {
+  it('skips a station right next to one already picked on the same kind of line', () => {
+    const stop = (name: string, lat: number, modes: string[]): MotisPlace => ({ name, stopId: name, lat, lon: -118.3406, modes });
+    const stations = [stop('utc', 33.9, ['TRAM']), stop('executive', 33.905, ['TRAM']), stop('coaster', 33.902, ['REGIONAL_RAIL']), stop('nobel', 33.89, ['TRAM'])];
+    const picked = pickCandidates(stations, [], torrance, santaMonica, 40, 3);
+    expect(picked.map((c) => c.name).sort()).toEqual(['coaster', 'nobel', 'utc'].sort());
   });
 });

@@ -29,7 +29,14 @@ const ROAD_FACTOR = 1.3;
 const TRANSIT_FACTOR = 1.25;
 // Getting out of a car at the curb and walking to (or from) the platform.
 const CURB_SEC = 60;
-const MAX_RIDESHARE_STATIONS = 4;
+const MAX_RIDESHARE_STATIONS = 6;
+// Picking a station next door to one already picked on the same kind of line (say, two adjacent
+// light rail stops) wastes a comparison slot on what's nearly the same trip.
+const MIN_STATION_SPACING_KM = 1;
+// Of those, the ones closest to the destination: the shortest (cheapest) rideshares.
+const CLOSEST_RIDESHARE_STATIONS = 3;
+// Straight-line reach of a rideshare of a given length, generous for city driving; TomTom checks it.
+const rideshareReachKm = (minutes: number) => (minutes / 60) * 40;
 const CORRIDOR_BANDS = 3;
 // What a transfer is worth in travel time: another line has to save more than this to be preferred.
 export const TRANSFER_PENALTY_SEC = 5 * 60;
@@ -48,6 +55,8 @@ export interface Candidate {
   /** Walk from the parking spot to the platform, when known. */
   walkSec: number;
   source: 'discovery' | 'nearby';
+  /** Transit modes stopping here, when known. */
+  modes?: string[];
   /** Heuristic door-to-door estimate in seconds, used for ranking only. */
   estimateSec: number;
 }
@@ -127,6 +136,7 @@ export function pickCandidates(
   to: LatLon,
   maxKm: number,
   count: number,
+  closest = 0,
 ): Candidate[] {
   const ranked: Candidate[] = [];
   for (const s of nearby) {
@@ -142,6 +152,7 @@ export function pickCandidates(
       walkSec: 0,
       source: 'nearby',
       estimateSec: score,
+      modes: s.modes,
     });
   }
   ranked.sort((a, b) => a.estimateSec - b.estimateSec);
@@ -157,12 +168,23 @@ export function pickCandidates(
   }
 
   const picked: Candidate[] = [];
+  const sameLineKind = (a: Candidate, b: Candidate) => !!a.modes?.some((m) => b.modes?.includes(m));
   const isDuplicate = (c: Candidate) =>
-    picked.some((p) => p.key === c.key || (p.name === c.name && haversineKm(p.station, c.station) < 0.4));
+    picked.some(
+      (p) =>
+        p.key === c.key ||
+        (p.name === c.name && haversineKm(p.station, c.station) < 0.4) ||
+        (sameLineKind(p, c) && haversineKm(p.station, c.station) < MIN_STATION_SPACING_KM),
+    );
   const take = (c: Candidate | undefined) => {
     if (c && picked.length < count && !isDuplicate(c)) picked.push(c);
   };
   discovered.forEach(take);
+  // The `closest` stations to `from` first, then the spread along the corridor.
+  [...ranked]
+    .sort((a, b) => haversineKm(from, a.station) - haversineKm(from, b.station))
+    .slice(0, closest)
+    .forEach(take);
   while (picked.length < count && bands.some((b) => b.length)) {
     for (const band of bands) {
       while (band.length) {
@@ -292,6 +314,29 @@ export function earlyExits(it: MotisItinerary): { legIndex: number; stops: numbe
 const DOMINANCE_SLACK_SEC = 5 * 60;
 const DOMINANCE_MARGIN_SEC = 15 * 60;
 
+/** How long the rideshare at the end of an option takes (0 if it doesn't end with one). */
+const finalRideSec = (o: TripOption) => {
+  const last = o.legs[o.legs.length - 1];
+  return last?.mode === 'RIDESHARE' ? last.durationSec : 0;
+};
+
+/**
+ * Whether a drive-park-transit-rideshare option is pointless next to parking near the destination
+ * and taking a rideshare from there: it takes DOMINANCE_MARGIN_SEC longer or more, while the
+ * transit saves neither driving nor rideshare (each within TRANSFER_PENALTY_SEC). If parking
+ * near the destination means driving clearly further, the transit is doing its job.
+ */
+export function slowerThanParkAndRideshare(option: TripOption, parkAndRideshare: TripOption): boolean {
+  const ride = finalRideSec(option);
+  const drive = option.traffic?.driveSec ?? 0;
+  return (
+    ride > 0 &&
+    option.durationSec >= parkAndRideshare.durationSec + DOMINANCE_MARGIN_SEC &&
+    finalRideSec(parkAndRideshare) <= ride + TRANSFER_PENALTY_SEC &&
+    (parkAndRideshare.traffic?.driveSec ?? Infinity) <= drive + TRANSFER_PENALTY_SEC
+  );
+}
+
 /** Options without the ones another option clearly beats (see DOMINANCE_MARGIN_SEC). */
 export function dropDominated(options: TripOption[], arriveBy: boolean): TripOption[] {
   const slack = DOMINANCE_SLACK_SEC * 1000;
@@ -326,6 +371,24 @@ export function exitEarly(it: MotisItinerary, legIndex: number, lastMileSec: num
     duration: Math.round((end - ms(it.startTime)) / 1000),
     transfers: legs.filter((l) => !STREET_MODES.has(l.mode)).length - 1,
   };
+}
+
+/** Whether a trip passes through a station it already left, like riding one stop out and back. */
+export function revisitsStation(it: MotisItinerary): boolean {
+  const seen = new Set<string>();
+  let previous: string | undefined;
+  for (const leg of it.legs) {
+    if (STREET_MODES.has(leg.mode)) continue;
+    for (const p of [leg.from, ...(leg.intermediateStops ?? []), leg.to]) {
+      const key = p.parentId ?? p.stopId ?? `${p.lat.toFixed(4)},${p.lon.toFixed(4)}`;
+      // The same station twice in a row is a change of lines there, not a revisit.
+      if (key === previous) continue;
+      if (seen.has(key)) return true;
+      seen.add(key);
+      previous = key;
+    }
+  }
+  return false;
 }
 
 /** TomTom wants an RFC 3339 time in the future, or "now". */
@@ -756,11 +819,12 @@ function planQuery(ctx: PlanContext, params: PlanParams, offsets?: Offsets): Pro
 }
 
 /**
- * A plan query keeping only trips that ride at least `minTransitStops` stops. If Transitous's
- * picks all ride fewer, ask once more without the stations those trips used: their boarding
- * stations (`retryWithout: 'boarding'`, for a station list the app chose) or the stations they
- * got off at for a rideshare. The next-best is usually further along the line. `tooShort` says
- * there were trips, but none rode far enough; `short` lists them.
+ * A plan query keeping only sensible trips: ones that ride at least `minTransitStops` stops and
+ * don't loop back through a station. If none are left, ask once more without the stations the
+ * others used: their boarding stations (`retryWithout: 'boarding'`, for a station list the app
+ * chose) or the stations they got off at for a rideshare. The next-best is usually further along
+ * the line. `tooShort` says there were trips, but none rode far enough; `short` lists every trip
+ * dropped.
  */
 async function planTransit(
   ctx: PlanContext,
@@ -770,8 +834,8 @@ async function planTransit(
   retryWithout: 'boarding' | 'exit' = 'exit',
 ): Promise<{ plan: PlanResponse; tooShort: boolean; short: MotisItinerary[] }> {
   const plan = await planQuery(ctx, params, offsets);
-  if (req.minTransitStops <= 1 || !plan.itineraries.length) return { plan, tooShort: false, short: [] };
-  const isShort = (it: MotisItinerary) => transitStops(it) < req.minTransitStops;
+  if (!plan.itineraries.length) return { plan, tooShort: false, short: [] };
+  const isShort = (it: MotisItinerary) => transitStops(it) < req.minTransitStops || revisitsStation(it);
   const short = plan.itineraries.filter(isShort);
   let kept: PlanResponse = { ...plan, itineraries: plan.itineraries.filter((it) => !isShort(it)) };
   const side = retryWithout === 'boarding' ? 'fromOffsets' : 'toOffsets';
@@ -784,7 +848,8 @@ async function planTransit(
       kept = { ...retry, itineraries: retry.itineraries.filter((it) => !isShort(it)) };
     }
   }
-  return { plan: kept, tooShort: !kept.itineraries.length, short };
+  const tooShort = !kept.itineraries.length && short.some((it) => transitStops(it) < req.minTransitStops);
+  return { plan: kept, tooShort, short };
 }
 
 function rethrowIfFatal(err: unknown, signal?: AbortSignal) {
@@ -868,8 +933,18 @@ async function prepareRideshareLastMile(
     rethrowIfFatal(err, signal);
     return [] as MotisPlace[];
   });
-  // Same ranking as for the first leg, seen from the destination's side.
-  const candidates = pickCandidates(nearby, [], req.to, req.from, maxKm, Math.min(req.stationsToCompare, MAX_RIDESHARE_STATIONS));
+  // Same ranking as for the first leg, seen from the destination's side, within rideshare reach,
+  // and always including the closest stations: a shorter rideshare is a cheaper one.
+  const reachKm = Math.min(maxKm, rideshareReachKm(req.maxLastLegMin));
+  const candidates = pickCandidates(
+    nearby.filter((s) => haversineKm(s, req.to) <= reachKm),
+    [],
+    req.to,
+    req.from,
+    maxKm,
+    Math.min(req.stationsToCompare, MAX_RIDESHARE_STATIONS),
+    CLOSEST_RIDESHARE_STATIONS,
+  );
   if (!candidates.length) {
     notes.push(`No stations within about ${req.maxLastLegMin} minutes’ ride of the destination, so there are no rideshare options.`);
     return undefined;
@@ -1065,7 +1140,18 @@ export async function planTrip(search: TripRequest, opts: PlanOptions): Promise<
     req.firstLegs.includes('CAR_PARKING') && req.lastLegs.includes('RIDESHARE') ? planParkAndRideshare(req, ctx) : undefined,
   ]);
 
-  const all = sortOptions(dropDominated(results.flatMap((r) => r.options), req.arriveBy), req.arriveBy);
+  let candidates = results.flatMap((r) => r.options);
+  if (parkAndRideshare) {
+    const before = candidates.length;
+    candidates = candidates.filter((o) => !(o.id.startsWith('parkride:CAR_PARKING:') && slowerThanParkAndRideshare(o, parkAndRideshare)));
+    const hidden = before - candidates.length;
+    if (hidden) {
+      notes.push(
+        `Hid ${hidden} transit option${hidden > 1 ? 's' : ''} slower than parking at ${parkAndRideshare.station?.name ?? 'a station'} and taking a rideshare from there, with no shorter rideshare to show for it.`,
+      );
+    }
+  }
+  const all = sortOptions(dropDominated(candidates, req.arriveBy), req.arriveBy);
   const options = all.slice(0, MAX_OPTIONS);
   // No-transit alternatives, for comparison.
   const direct = [
@@ -1079,7 +1165,9 @@ export async function planTrip(search: TripRequest, opts: PlanOptions): Promise<
     notes.push(`Hid ${n} option${n > 1 ? 's' : ''} riding fewer than ${req.minTransitStops} stops on transit (see Limits).`);
   }
   if (all.length > MAX_OPTIONS) notes.push(`Showing the ${MAX_OPTIONS} best of ${all.length} options.`);
-  if (!all.length) notes.push('No transit connections found. Try more transit modes or a longer first/last leg.');
+  if (!all.length && candidates.length === results.flatMap((r) => r.options).length) {
+    notes.push('No transit connections found. Try more transit modes or a longer first/last leg.');
+  }
   return { options, direct, notes: [...new Set(notes)], usage };
 }
 
@@ -1171,10 +1259,29 @@ async function planCarFirst(req: LegCombo, ctx: PlanContext): Promise<ComboResul
   const direct = await directCar();
   if (req.lastLeg === 'RIDESHARE' && !lastMile) return { options: [], direct };
 
-  const discovered = discovery ? discoveryCandidates(discovery, req.from, req.to) : [];
-  const nearbyPicks = pickCandidates(nearby, discovered, req.from, req.to, maxKm, req.stationsToCompare);
+  // With a rideshare last leg, a station already within rideshare range of the destination is
+  // somewhere to park and rideshare from (shown for comparison), not somewhere to start transit,
+  // and a station the rideshare picks up from can't also be a start. Leaving them out before
+  // choosing leaves room for stations nearer home.
+  const scale = lastMile ? rideScale(req, lastMile) : 1;
+  const pickups = new Set(lastMile?.offsets.map((o) => o.stopId));
+  const usable = (station: LatLon, stopId?: string) =>
+    !lastMile || (!pickups.has(stopId ?? '') && estimateDrive(station, req.to).seconds * scale > req.maxLastLegMin * 60);
+  const discovered = (discovery ? discoveryCandidates(discovery, req.from, req.to) : []).filter((c) => usable(c.station, c.stopId));
+  const nearbyPicks = pickCandidates(
+    nearby.filter((s) => usable(s, s.stopId)),
+    discovered,
+    req.from,
+    req.to,
+    maxKm,
+    req.stationsToCompare,
+  );
   if (!nearbyPicks.length) {
-    ctx.notes.push(`No stations found within about ${req.maxFirstLegMin} minutes’ drive for the selected transit modes.`);
+    ctx.notes.push(
+      lastMile && nearby.length
+        ? 'Every station within reach is already a short rideshare from the destination, so no transit-then-rideshare trips were planned.'
+        : `No stations found within about ${req.maxFirstLegMin} minutes’ drive for the selected transit modes.`,
+    );
     return { options: [], direct };
   }
 
@@ -1186,16 +1293,6 @@ async function planCarFirst(req: LegCombo, ctx: PlanContext): Promise<ComboResul
   const drives = keep.map((i) => allDrives[i]);
 
   let pool = candidates.map((_, i) => i);
-  if (lastMile) {
-    // A station already within rideshare range of the destination is somewhere to park and
-    // rideshare from (shown for comparison), not somewhere to start a transit trip.
-    const scale = rideScale(req, lastMile);
-    pool = pool.filter((i) => estimateDrive(candidates[i].station, req.to).seconds * scale > req.maxLastLegMin * 60);
-    if (!pool.length) {
-      ctx.notes.push(`Every station within reach is already a short rideshare from the destination, so no transit-then-rideshare trips were planned.`);
-      return { options: [], direct };
-    }
-  }
 
   onProgress?.(`Planning transit from ${pool.length} stations…`);
   const bufferSec = firstLegBufferSec(req);
