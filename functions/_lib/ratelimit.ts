@@ -12,9 +12,9 @@ export interface RateEnv extends UsageEnv {
 }
 
 export type { Service } from './upstream-common';
-import type { Service } from './upstream-common';
+import { isOverpass, type Service } from './upstream-common';
 
-const DEFAULTS = { tomtom: 4, transitous: 4, overpass: 1, clientPerMinute: 120 };
+const DEFAULTS = { tomtom: 4, transitous: 4, overpassPerServer: 1, clientPerMinute: 120 };
 const MAX_WAIT_MS = 8000;
 
 export interface Clock {
@@ -93,10 +93,9 @@ export async function guardUpstream(
       return rejected(429, `Too many requests from this device; try again in ${retryAfter} s`, retryAfter);
     }
 
-    const perSecond =
-      service === 'overpass'
-        ? DEFAULTS.overpass
-        : positive(service === 'tomtom' ? env.TOMTOM_MAX_PER_SECOND : env.TRANSITOUS_MAX_PER_SECOND, DEFAULTS[service]);
+    const perSecond = isOverpass(service)
+      ? DEFAULTS.overpassPerServer
+      : positive(service === 'tomtom' ? env.TOMTOM_MAX_PER_SECOND : env.TRANSITOUS_MAX_PER_SECOND, DEFAULTS[service]);
     if (!(await waitForSlot(db, `service:${service}`, perSecond, MAX_WAIT_MS, clock))) {
       return rejected(503, 'Server busy; try again shortly', 2);
     }

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { COOLDOWN_SEC, onRequestPost, OVERPASS_URL, parseStations, type ParkingEnv as Env } from '../functions/api/parking';
+import { MIRROR_HEADER, onRequestPost, parseStations, type ParkingEnv as Env } from '../functions/api/parking';
+import { failed, MIRRORS } from '../functions/_lib/overpass';
 import { classifyParking, overpassQuery, type OverpassElement } from '../functions/_lib/parking';
 import { sqliteDb } from './sqlite';
 
@@ -71,8 +72,39 @@ describe('parseStations', () => {
   });
 });
 
+describe('Overpass servers', () => {
+  it('uses the regional server only where it has data', () => {
+    const dresel = MIRRORS.find((m) => m.id === 'dresel')!;
+    expect(dresel.endpoint([nobelDrive, utc])).toBe('https://ovp.dresel.systems/api-na/interpreter');
+    expect(dresel.endpoint([{ lat: 48.137, lon: 11.575 }])).toBe('https://ovp.dresel.systems/api/interpreter');
+    expect(dresel.endpoint([{ lat: 35.68, lon: 139.77 }])).toBeNull();
+  });
+
+  it('sends the contact to Private.coffee only', () => {
+    expect(MIRRORS.filter((m) => m.contact).map((m) => m.id)).toEqual(['private.coffee']);
+  });
+
+  it('pauses a failing server for longer each time, up to an hour', () => {
+    const t = 1_000_000;
+    const once = failed(null, t);
+    expect(once).toEqual({ failures: 1, until: t + 300_000 });
+    expect(failed(once, t).until).toBe(t + 600_000);
+    expect(failed({ failures: 9, until: 0 }, t).until).toBe(t + 3_600_000);
+  });
+});
+
 describe('POST /api/parking', () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  type Init = RequestInit & { headers: Record<string, string> };
+  /** A fetch stub answering per server: elements, or an HTTP status for a failure. */
+  const servers = (answers: Record<string, OverpassElement[] | number>) =>
+    vi.fn(async (url: string, _init: Init) => {
+      const id = Object.keys(answers).find((host) => url.includes(host));
+      const answer = id === undefined ? 503 : answers[id];
+      return typeof answer === 'number' ? new Response('busy', { status: answer }) : Response.json({ elements: answer });
+    });
+  const hosts = (fetcher: ReturnType<typeof servers>) => fetcher.mock.calls.map(([url]) => new URL(url).host);
 
   const call = async (env: Env, stations: unknown[]) => {
     const pending: Promise<unknown>[] = [];
@@ -85,17 +117,17 @@ describe('POST /api/parking', () => {
     return { res, body: (await res.json()) as { parking: unknown[]; incomplete?: boolean } };
   };
 
-  it('asks Overpass once by POST with a contact, then answers from the cache', async () => {
-    const overpass = vi.fn(async () => Response.json({ elements: [...nobelLots, ...utcLots] }));
-    vi.stubGlobal('fetch', overpass);
+  it('asks Private.coffee by POST with the contact, then answers from the cache', async () => {
+    const fetcher = servers({ 'private.coffee': [...nobelLots, ...utcLots] });
+    vi.stubGlobal('fetch', fetcher);
     const env = { USAGE_DB: sqliteDb(), MULTIMODALNAV_CONTACT: 'ops@example.com' } as Env;
 
     const first = await call(env, [nobelDrive, utc]);
     expect(first.body.parking.map((p) => (p as { status: string }).status)).toEqual(['free', 'paid']);
     expect(first.res.headers.get('X-Cache')).toBe('MISS');
-    expect(overpass).toHaveBeenCalledTimes(1);
-    const [url, init] = overpass.mock.calls[0] as unknown as [string, RequestInit & { headers: Record<string, string> }];
-    expect(url).toBe(OVERPASS_URL);
+    expect(first.res.headers.get(MIRROR_HEADER)).toBe('private.coffee');
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('https://overpass.private.coffee/api/interpreter');
     expect(init.method).toBe('POST');
     expect(init.headers['User-Agent']).toMatch(/^MultiModalNav\/.* \(\+https:\/\/github\.com\/thinkaliker\/MultiModalNav; ops@example\.com\)$/);
     expect(new URLSearchParams(init.body as string).get('data')).toBe(overpassQuery([nobelDrive, utc]));
@@ -103,23 +135,37 @@ describe('POST /api/parking', () => {
     const again = await call(env, [utc]);
     expect(again.res.headers.get('X-Cache')).toBe('HIT');
     expect(again.body.parking).toEqual([first.body.parking[1]]);
-    expect(overpass).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
-  it('answers "unknown for now" when Overpass fails, and leaves it alone for a while', async () => {
-    const overpass = vi.fn(async () => new Response('busy', { status: 504 }));
-    vi.stubGlobal('fetch', overpass);
+  it('moves on to the next server without the contact, and skips a failed one for a while', async () => {
+    const fetcher = servers({ 'private.coffee': 504, 'dresel.systems': [...nobelLots, ...utcLots] });
+    vi.stubGlobal('fetch', fetcher);
+    const env = { USAGE_DB: sqliteDb(), MULTIMODALNAV_CONTACT: 'ops@example.com' } as Env;
+
+    const first = await call(env, [nobelDrive]);
+    expect(first.body.parking).toEqual([expect.objectContaining({ status: 'free' })]);
+    expect(first.res.headers.get(MIRROR_HEADER)).toBe('dresel');
+    expect(hosts(fetcher)).toEqual(['overpass.private.coffee', 'ovp.dresel.systems']);
+    expect(fetcher.mock.calls[1][1].headers['User-Agent']).not.toContain('ops@example.com');
+
+    await call(env, [utc]);
+    expect(hosts(fetcher).slice(2)).toEqual(['ovp.dresel.systems']);
+  });
+
+  it('answers "unknown for now" when every server fails, then leaves them alone', async () => {
+    const fetcher = servers({});
+    vi.stubGlobal('fetch', fetcher);
     const env = { USAGE_DB: sqliteDb() } as Env;
 
     expect((await call(env, [utc])).body).toEqual({ parking: [null], incomplete: true });
+    expect(hosts(fetcher)).toEqual(['overpass.private.coffee', 'ovp.dresel.systems', 'maps.mail.ru', 'overpass-api.de']);
     expect((await call(env, [nobelDrive])).body).toEqual({ parking: [null], incomplete: true });
-    expect(overpass).toHaveBeenCalledTimes(1);
-    expect(COOLDOWN_SEC).toBeGreaterThanOrEqual(60);
+    expect(fetcher).toHaveBeenCalledTimes(4);
   });
 
-  it('does not cache a query Overpass cut short', async () => {
-    const overpass = vi.fn(async () => Response.json({ elements: [], remark: 'runtime error: Query timed out' }));
-    vi.stubGlobal('fetch', overpass);
+  it('does not cache a query a server cut short', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ elements: [], remark: 'runtime error: Query timed out' })));
     expect((await call({ USAGE_DB: sqliteDb() } as Env, [utc])).body.incomplete).toBe(true);
   });
 

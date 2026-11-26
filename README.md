@@ -9,7 +9,7 @@ A park-and-ride and multimodal trip planner, built as an installable web app (PW
 | Map | [OpenFreeMap](https://openfreemap.org) + MapLibre GL | No key needed |
 | Transit, walk and bike routing, stations, place search | [Transitous](https://transitous.org) (MOTIS 2 API) | No key; worldwide community GTFS/GTFS-RT feeds |
 | Driving with traffic | [TomTom Routing API](https://developer.tomtom.com) | Free tier, key kept server-side |
-| Parking at stations | OpenStreetMap via the [Private.coffee Overpass API](https://overpass.private.coffee/) | No key; only with "Prioritize free parking" |
+| Parking at stations | OpenStreetMap via public Overpass API servers ([Private.coffee](https://overpass.private.coffee/) first) | No key; only with "Prioritize free parking" |
 | Hosting, API proxy, password | Cloudflare Pages + Functions | |
 
 A drive-first search:
@@ -49,8 +49,19 @@ With **Prioritize free parking** on (under More options, on by default, for "Dri
 - The app looks at 4 more stations than "Stations to compare", then chooses again with parking counted. Stations with a free lot get a Transitous query of their own first, so faster stations can't crowd them out of the answer; the rest follow in a second query for comparison. This uses the query budget already set aside for the comparison.
 - The drive goes to the lot itself, when one is known. The park-near-the-destination comparison is ranked with its parking too.
 - Each drive-and-park option shows its parking ("Free parking", "Paid parking", …), and the details show the lot and its distance from the platform.
-- Parking for a station is kept in the cache for 30 days, so a station costs one lookup a month. A search waits at most 6 seconds for parking; after that it compares stations without it (the server still finishes and caches the lookup). If Overpass fails, the server leaves it alone for 5 minutes.
-- Only station positions are sent to Overpass, never your start or destination. The requests follow [its terms](https://overpass.private.coffee/#terms): POST requests, a User-Agent with the app's name and your contact (`MULTIMODALNAV_CONTACT`), and one query at a time across all users. Its [privacy policy](https://overpass.private.coffee/#privacy) is linked in the app footer.
+- Parking for a station is kept in the cache for 30 days, so a station costs one lookup a month. A search waits at most 10 seconds for parking; after that it compares stations without it (the server still finishes and caches the lookup).
+- Only station positions are sent, never your start or destination. The lookup goes to the first of these public Overpass servers that answers:
+
+  | Server | Covers | Notes |
+  | --- | --- | --- |
+  | [Private.coffee](https://overpass.private.coffee/) | Whole planet | Free, no rate limit. The only one that gets your contact (`MULTIMODALNAV_CONTACT`) |
+  | [dresel.systems](https://ovp.dresel.systems/) | North America and Europe (the app only uses it for the US, Canada and western/central Europe) | Free, no key, data refreshed nightly, up to 4 queries at once per IP |
+  | [VK Maps](https://maps.mail.ru/osm/tools/overpass/) (maps.mail.ru, run by VK in Russia) | Whole planet | Free, "no requests limitations" |
+  | [overpass-api.de](https://overpass-api.de/) (FOSSGIS) | Whole planet | Often overloaded and asks apps to prefer alternatives, so it's last, and capped at 50 queries a day (`OVERPASS_DE_DAILY_LIMIT`) to stay under its guideline of 100 |
+
+- Each server gets POST requests, one at a time across all users (its own queue), and gives up after 6 seconds. Servers other than Private.coffee get a User-Agent with the app's name and repo link, which is what their policies ask for.
+- A server that fails or times out is skipped for 5 minutes, doubling each time it fails again, up to an hour. A success resets it. The `X-Overpass-Mirror` response header says which server answered.
+- Private.coffee's [privacy policy](https://overpass.private.coffee/#privacy) is linked in the app footer, as its terms ask.
 - Turn it off to skip the lookups entirely.
 
 **No-transit comparisons** appear under "For comparison": driving or rideshare the whole way, walking or biking the whole way, and, when both "Drive & park" and "Rideshare" are selected, **park near the destination and rideshare the rest**. That last one parks at a station lot near the destination (from the rideshare search) and doesn't count against the max-drive limit.
@@ -73,7 +84,8 @@ The server also limits upstream calls across **all** connected clients, so sever
 | TomTom requests in flight, all clients (`TOMTOM_MAX_IN_FLIGHT`, queue) | 2 | The request waits its turn (up to 15 s), then gets HTTP 503 |
 | Transitous requests in flight, all clients (`TRANSITOUS_MAX_IN_FLIGHT`, queue) | 3 | Same as above |
 | TomTom / Transitous requests per second (`TOMTOM_MAX_PER_SECOND`, `TRANSITOUS_MAX_PER_SECOND`, fallback) | 4 / 4 | The request waits for the next free second (up to 8 s), then gets HTTP 503 |
-| Overpass (parking) requests, all clients (fixed) | 1 at a time (queue), 1 per second (fallback) | Same as above; parking then counts as unknown for that search |
+| Overpass (parking) requests, all clients, per server (fixed) | 1 at a time (queue, waits up to 3 s), 1 per second (fallback) | The next server is tried; if none answers, parking counts as unknown for that search |
+| overpass-api.de queries per day (`OVERPASS_DE_DAILY_LIMIT`) | 50 | That server is skipped until the next UTC day |
 | Requests per minute from one device (`CLIENT_MAX_PER_MINUTE`, both) | 120 | HTTP 429 with a `Retry-After`, so one runaway client can't starve the others |
 
 - Station-list tiles skip these limits. They come in a burst at the start of a search and are mostly served from Cloudflare's cache.
@@ -166,18 +178,18 @@ If a deploy fails with an error about the D1 binding, the `database_id` in `wran
 
 The queue is a separate Worker, because Pages projects can't host Durable Objects. It's on the free plan: Durable Objects allow 100,000 requests a day, and each upstream call is one request. Deploy it **before** turning on the binding, or the Pages deploy will fail.
 
-1. **Deploy the gate Worker.** Do this once now, and again whenever `gate/` or `functions/_lib/upstream-common.ts` changes. Either:
-   - **Let Cloudflare deploy it on every push:** go to **Workers & Pages → Create application → Workers → Import a repository**, then pick this repo.
-     - Project name: `multimodalnav-gate` (must match `name` in `gate/wrangler.toml`)
+1. **Deploy the gate Worker, and have Cloudflare redeploy it on every push** that changes it, next to the Pages deploy:
+   - **If the gate isn't deployed yet:** go to **Workers & Pages → Create application → Workers → Import a repository** and pick this repo, with the settings below. The Worker name must be `multimodalnav-gate` (the `name` in `gate/wrangler.toml`).
+   - **If you already deployed it from your machine:** open **Workers & Pages → multimodalnav-gate → Settings → Builds → Connect**, pick this repo, and use these settings:
+     - Branch: `main`
      - Root directory: `gate`
      - Build command: leave blank
-     - Deploy command: `npx wrangler deploy`
-   - **Or from your machine:**
-     ```sh
-     cd gate
-     npx wrangler deploy
-     ```
-   The Worker has no public URL (`workers_dev = false`); only the Pages project can reach it.
+     - Deploy command: `npx wrangler deploy` (the default). It uses the Wrangler version pinned in `gate/package.json`.
+     - Build watch paths, include: `gate/*`, `functions/_lib/upstream-common.ts`, `functions/_lib/http.ts`. Pushes that don't touch the gate's code then skip the build. If a push that does touch it doesn't trigger a build, set the include back to `*`. Redeploying the gate when nothing changed is harmless.
+     - Branch control: untick **Enable Preview Builds**. Other branches don't need their own queue.
+   - **Or deploy by hand:** `cd gate && npx wrangler deploy`. You'd need to repeat it whenever the gate's code changes.
+
+   The Worker has no public URL (`workers_dev = false`); only the Pages project can reach it. The build reads the shared code from `functions/_lib/`, which Cloudflare checks out along with the rest of the repo.
 2. **Turn on the binding:** in the main `wrangler.toml`, uncomment the `[[durable_objects.bindings]]` block at the bottom, then commit and push.
 3. **Check it:** run a search, then in the browser's dev tools open any `/api/transit/…` or `/api/traffic/…` response. It should have `X-Upstream-Via: gate`. `limiter` means the Pages project can't reach the queue; the Functions logs will say why.
 
@@ -216,7 +228,7 @@ npm run deploy
 | --- | --- | --- |
 | `APP_PASSWORD` | yes | Password for the app; also signs the session cookie |
 | `TOMTOM_API_KEY` | no | Traffic-aware drive and rideshare times; without it they're estimates |
-| `MULTIMODALNAV_CONTACT` | recommended | Your email or a URL, sent to Transitous and the Private.coffee Overpass API in the User-Agent (`MultiModalNav/<version> (+<repo>; <contact>)`), as their usage policies ask. Formerly `TRANSITOUS_CONTACT` |
+| `MULTIMODALNAV_CONTACT` | recommended | Your email or a URL, sent to Transitous and the Private.coffee Overpass API (not the other Overpass servers) in the User-Agent (`MultiModalNav/<version> (+<repo>; <contact>)`), as their usage policies ask. Formerly `TRANSITOUS_CONTACT` |
 | `TOMTOM_MONTHLY_LIMIT` | no (in `wrangler.toml`) | TomTom routes per month before calls stop; default 20000 |
 | `TRANSITOUS_DAILY_LIMIT` | no (in `wrangler.toml`) | Transitous plan queries per day shown in the footer; default 720 |
 | `TOMTOM_MAX_PER_SECOND` | no (in `wrangler.toml`) | TomTom requests per second across all clients; default 4 |
@@ -224,6 +236,7 @@ npm run deploy
 | `TOMTOM_MAX_IN_FLIGHT` | no (in `wrangler.toml`) | TomTom requests running at once, all clients, with the queue; default 2 |
 | `TRANSITOUS_MAX_IN_FLIGHT` | no (in `wrangler.toml`) | Transitous requests running at once, all clients, with the queue; default 3 |
 | `CLIENT_MAX_PER_MINUTE` | no (in `wrangler.toml`) | Upstream requests per minute from one device; default 120 |
+| `OVERPASS_DE_DAILY_LIMIT` | no (in `wrangler.toml`) | Parking queries a day to overpass-api.de, all clients; default 50 |
 | `USAGE_DB` | recommended (D1 binding) | Turns on usage tracking, the TomTom monthly stop, the fallback limiter and the response cache |
 | `GATE` | recommended (Durable Object binding) | The request queue from `gate/`; see step 4 |
 
@@ -237,6 +250,7 @@ Every `/api/*` route except login and logout requires a session cookie. The cook
 
 - **Transitous** is a volunteer service for open-source, non-commercial apps. Its [usage policy](https://transitous.org/api/) asks for a visible link to [its data sources](https://transitous.org/sources/) (shown in the app footer), a User-Agent with contact details (set by the proxy from `MULTIMODALNAV_CONTACT`), and a heads-up for heavy use.
 - **Private.coffee Overpass** is free, with no hard rate limits. Its [terms](https://overpass.private.coffee/#terms) ask for POST requests, a meaningful User-Agent with a contact (from `MULTIMODALNAV_CONTACT`), few simultaneous requests, notice before going above 10 requests a second or 10 at once, OpenStreetMap credit, no personal data in queries, and a link to its privacy policy. The app queries one at a time, sends only station positions, caches answers for 30 days, and links the policy in the footer. It records the User-Agent (with your contact) for up to 48 hours.
+- **The other Overpass servers** ([list above](#free-parking)) are free and keyless. dresel.systems asks for an identifying User-Agent and at most 4 parallel queries. VK Maps states no limits. overpass-api.de asks for an identifying User-Agent, no parallel queries, under 100 queries a day for regular use across all of an app's users, and a 30-second pause after a 429; the app caps it at 50 a day and pauses for 5 minutes or more after any failure.
 - **OpenStreetMap / OpenFreeMap** attribution is shown on the map.
 - Check TomTom's terms for your use when you sign up.
 
@@ -247,6 +261,6 @@ Every `/api/*` route except login and logout requires a session cookie. The cook
 - **"Own bike" doesn't restrict to bike-friendly trains**, because many feeds don't publish that data and enabling the filter returns no results. Check the agency's bike rules.
 - **Bike/scooter share** needs share-system data in Transitous, which many areas lack.
 - **Parking** is only as good as OpenStreetMap's tags: many lots have no `fee` or `access` tag (shown as unknown), and street parking isn't counted. Prices and availability aren't known. Without "Prioritize free parking", parking comes from Transitous's park-and-ride pick when it finds one, and other stations assume you park at the station.
-- **Private.coffee's Overpass server can be unavailable.** In testing on 26 November 2026, its API didn't answer for over an hour. Searches then plan without parking data (with a note) and try again after 5 minutes.
+- **Public Overpass servers are often overloaded.** In testing on 26 November 2026, Private.coffee and overpass-api.de didn't answer for over an hour, while dresel.systems answered in 2 seconds and VK Maps in 10. The app moves on to the next server. If none answers in time, the search plans without parking data and says so.
 - **Rideshare** is modeled as your pickup wait plus a car trip in traffic. The app has no price, surge or availability data.
 - **Park-and-ride (`CAR_PARKING`) is marked experimental** in the MOTIS API, so it may change.

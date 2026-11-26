@@ -109,7 +109,7 @@ describe('GateCore timeouts', () => {
       seen.push(init);
       return new Response('{}');
     });
-    await gate.handle(job({ service: 'overpass', timeoutMs: 20_000 }));
+    await gate.handle(job({ service: 'overpass:private.coffee', timeoutMs: 20_000 }));
     expect(seen[0].timeoutMs).toBe(20_000);
   });
 });

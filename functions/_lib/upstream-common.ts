@@ -2,7 +2,10 @@
 
 import { json } from './http';
 
-export type Service = 'tomtom' | 'transitous' | 'overpass';
+/** An upstream service; each Overpass server ("overpass:<id>") gets a queue of its own. */
+export type Service = 'tomtom' | 'transitous' | `overpass:${string}`;
+
+export const isOverpass = (service: Service): service is `overpass:${string}` => service.startsWith('overpass:');
 
 /** Edge-cache options for a request (the subset of Cloudflare's `cf` options used here). */
 export interface CacheOptions {

@@ -231,9 +231,9 @@
         {#if auth === 'signed-in'}<UsageFooter report={usage} />{/if}
         Transit routing by <a href="https://transitous.org" target="_blank" rel="noopener">Transitous</a>
         (<a href="https://transitous.org/sources/" target="_blank" rel="noopener">data sources</a>) ·
-        traffic by TomTom · parking via
-        <a href="https://overpass.private.coffee/" target="_blank" rel="noopener">Private.coffee Overpass</a>
-        (<a href="https://overpass.private.coffee/#privacy" target="_blank" rel="noopener">privacy</a>) · map by
+        traffic by TomTom · parking via Overpass from
+        <a href="https://overpass.private.coffee/" target="_blank" rel="noopener">Private.coffee</a>
+        (<a href="https://overpass.private.coffee/#privacy" target="_blank" rel="noopener">privacy</a>) and other public servers · map by
         <a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a>,
         © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors ·
         <a href="https://github.com/thinkaliker/MultiModalNav" target="_blank" rel="noopener">source</a>

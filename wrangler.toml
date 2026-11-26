@@ -14,6 +14,8 @@ compatibility_date = "2025-09-01"
 [vars]
 TOMTOM_MONTHLY_LIMIT = "20000"
 TRANSITOUS_DAILY_LIMIT = "720"
+# Parking queries a day to overpass-api.de (its guideline is under 100), across all clients.
+OVERPASS_DE_DAILY_LIMIT = "50"
 # Shared across all clients. With the GATE queue: requests in flight at once per service.
 # Without it (fallback, needs USAGE_DB): requests started per second per service.
 # Either way: requests per minute from any one device.

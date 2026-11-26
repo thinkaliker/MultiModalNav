@@ -54,7 +54,8 @@ export const PARKING_PENALTY_SEC: Record<ParkingStatus, number> = { free: 0, unk
 // With free parking a priority, this many more stations are checked before choosing which to compare.
 const PARKING_EXTRA_PICKS = 4;
 // A search doesn't wait longer than this for parking data; it compares stations without it.
-const PARKING_WAIT_MS = 6000;
+// Long enough for the server to give up on one Overpass server and get an answer from the next.
+const PARKING_WAIT_MS = 10_000;
 
 /** What a station's parking counts for (nothing if it couldn't be looked up). */
 export const parkingPenaltySec = (info?: ParkingInfo) => (info ? PARKING_PENALTY_SEC[info.status] : 0);

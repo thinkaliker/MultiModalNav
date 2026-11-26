@@ -1,5 +1,5 @@
 import { guardUpstream, type RateEnv } from './ratelimit';
-import { fetchWithRetry, GATE_HEADER, REJECTED_HEADER, type CacheOptions, type GateJob, type Service } from './upstream-common';
+import { fetchWithRetry, GATE_HEADER, isOverpass, REJECTED_HEADER, type CacheOptions, type GateJob, type Service } from './upstream-common';
 
 /** The parts of the GATE Durable Object binding used here. */
 export interface GateBinding {
@@ -21,6 +21,8 @@ export interface UpstreamCall {
   body?: string;
   cf?: CacheOptions;
   timeoutMs?: number;
+  /** How long to wait in the gate's queue before giving up (default 15 s). */
+  maxWaitMs?: number;
 }
 
 export interface UpstreamResult {
@@ -31,8 +33,9 @@ export interface UpstreamResult {
   via: 'gate' | 'limiter';
 }
 
-// Overpass is a volunteer server whose terms ask apps to limit simultaneous requests.
-const DEFAULT_IN_FLIGHT: Record<Service, number> = { tomtom: 2, transitous: 3, overpass: 1 };
+const DEFAULT_IN_FLIGHT = { tomtom: 2, transitous: 3 };
+// Overpass servers are volunteer-run, and their terms ask apps to limit simultaneous requests.
+const OVERPASS_IN_FLIGHT = 1;
 const QUEUE_MAX_WAIT_MS = 15_000;
 
 function positive(value: string | undefined, fallback: number): number {
@@ -63,15 +66,14 @@ export async function callUpstream(
       cf: call.cf,
       timeoutMs: call.timeoutMs,
       limits: {
-        inFlight:
-          call.service === 'overpass'
-            ? DEFAULT_IN_FLIGHT.overpass
-            : positive(
-                call.service === 'tomtom' ? env.TOMTOM_MAX_IN_FLIGHT : env.TRANSITOUS_MAX_IN_FLIGHT,
-                DEFAULT_IN_FLIGHT[call.service],
-              ),
+        inFlight: isOverpass(call.service)
+          ? OVERPASS_IN_FLIGHT
+          : positive(
+              call.service === 'tomtom' ? env.TOMTOM_MAX_IN_FLIGHT : env.TRANSITOUS_MAX_IN_FLIGHT,
+              DEFAULT_IN_FLIGHT[call.service],
+            ),
         clientPerMinute: positive(env.CLIENT_MAX_PER_MINUTE, 120),
-        maxWaitMs: QUEUE_MAX_WAIT_MS,
+        maxWaitMs: call.maxWaitMs ?? QUEUE_MAX_WAIT_MS,
       },
     };
     try {

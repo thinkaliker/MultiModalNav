@@ -1,23 +1,29 @@
 import { CACHE_HEADER, cacheKey, readCache, writeCache } from '../_lib/cache';
 import { json } from '../_lib/http';
 import { classifyParking, overpassQuery, type OverpassElement, type ParkingInfo, type Point } from '../_lib/parking';
+import { failed, MIRRORS, type Health, type Mirror } from '../_lib/overpass';
 import { callUpstream, type UpstreamEnv } from '../_lib/upstream';
+import { limitFor, recordUse, undoUse } from '../_lib/usage';
 import { userAgent } from '../_lib/useragent';
 
-// Parking around transit stations, from OpenStreetMap through the Private.coffee Overpass API.
+// Parking around transit stations, from OpenStreetMap through public Overpass API servers
+// (see overpass.ts for which, in what order).
 // POST /api/parking  {"stations":[{"lat":32.8669,"lon":-117.2304}, ...]}
 //   -> {"parking":[ParkingInfo | null, ...], "incomplete"?: true}   (null: couldn't look it up)
-// Following its terms (https://overpass.private.coffee/): POST requests, a User-Agent with the
-// app's name and a contact, nothing personal in the query (only station positions), one query at
-// a time across all clients (the 'overpass' service in upstream.ts), and a pause after it fails
-// or is busy. Parking rarely changes, so each station's answer is kept for 30 days.
+// Following the servers' terms: POST requests, a User-Agent naming the app, nothing personal in
+// the query (only station positions), one query at a time per server across all clients, and a
+// pause after a server fails. Parking rarely changes, so each station's answer is kept for 30 days.
 
-export const OVERPASS_URL = 'https://overpass.private.coffee/api/interpreter';
 export const MAX_STATIONS = 24;
 const TTL_SEC = 30 * 86_400;
-const TIMEOUT_MS = 15_000;
-/** How long to leave Overpass alone after it fails. */
-export const COOLDOWN_SEC = 300;
+// Per server, then on to the next: an overloaded server can take far longer than this.
+const MIRROR_TIMEOUT_MS = 6000;
+const QUEUE_WAIT_MS = 3000;
+// Don't start on another server after this long; the Worker may stop soon after 30 s.
+const LOOKUP_BUDGET_MS = 15_000;
+const HEALTH_TTL_SEC = 86_400;
+/** Which server answered, for debugging. */
+export const MIRROR_HEADER = 'X-Overpass-Mirror';
 
 /** Valid station positions, rounded to about 10 m so nearby searches share cached answers. */
 export function parseStations(body: unknown): Point[] | null {
@@ -44,7 +50,7 @@ interface Context {
 }
 
 const stationKey = (p: Point) => cacheKey('parking:v1', String(p.lat), String(p.lon));
-const cooldownKey = () => cacheKey('overpass:cooldown');
+const healthKey = (mirror: Mirror) => cacheKey('overpass:health', mirror.id);
 
 async function cached(env: ParkingEnv, key: Promise<string>): Promise<string | null> {
   if (!env.USAGE_DB) return null;
@@ -55,53 +61,93 @@ async function cached(env: ParkingEnv, key: Promise<string>): Promise<string | n
   }
 }
 
+function parsed<T>(body: string | null): T | null {
+  try {
+    return body ? (JSON.parse(body) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function store(env: ParkingEnv, key: Promise<string>, body: string, contentType: string, ttlSec: number): Promise<void> {
   if (env.USAGE_DB) await writeCache(env.USAGE_DB, await key, { body, contentType }, ttlSec).catch(() => {});
 }
 
-/** One Overpass query for all `points`, classified; null if Overpass didn't answer in full. */
-async function lookup(env: ParkingEnv, request: Request, points: Point[], waitUntil: (p: Promise<unknown>) => void) {
-  if (await cached(env, cooldownKey())) return null;
-  let elements: OverpassElement[] | null = null;
-  let failed = true;
+/** Ask one server; its elements, 'failed' (counts against it) or 'skipped' (our own limits). */
+async function ask(
+  env: ParkingEnv,
+  request: Request,
+  mirror: Mirror,
+  url: string,
+  points: Point[],
+  waitUntil: (p: Promise<unknown>) => void,
+): Promise<OverpassElement[] | 'failed' | 'skipped'> {
+  if (mirror.dailyMetric && env.USAGE_DB) {
+    const allowed = await recordUse(env.USAGE_DB, mirror.dailyMetric, limitFor(env, mirror.dailyMetric)).catch(() => true);
+    if (!allowed) return 'skipped';
+  }
   try {
     const { response, rejected } = await callUpstream(
       env,
       request,
       {
-        service: 'overpass',
-        url: OVERPASS_URL,
+        service: `overpass:${mirror.id}`,
+        url,
         method: 'POST',
         headers: {
-          'User-Agent': userAgent(env.MULTIMODALNAV_CONTACT),
+          'User-Agent': userAgent(mirror.contact ? env.MULTIMODALNAV_CONTACT : undefined),
           Accept: 'application/json',
           'Content-Type': 'application/x-www-form-urlencoded',
         },
         body: new URLSearchParams({ data: overpassQuery(points) }).toString(),
-        timeoutMs: TIMEOUT_MS,
+        timeoutMs: MIRROR_TIMEOUT_MS,
+        maxWaitMs: QUEUE_WAIT_MS,
       },
       waitUntil,
     );
-    // Turned away by our own limiter: Overpass itself is fine.
-    if (rejected) failed = false;
-    if (response.ok && !rejected) {
-      const body = (await response.json()) as { elements?: OverpassElement[]; remark?: string };
-      // A query that ran out of time or memory still answers 200, with a remark and partial data.
-      if (Array.isArray(body.elements) && !body.remark?.includes('error')) elements = body.elements;
-    } else {
+    if (rejected) {
       await response.body?.cancel();
+      if (mirror.dailyMetric && env.USAGE_DB) await undoUse(env.USAGE_DB, mirror.dailyMetric).catch(() => {});
+      return 'skipped';
     }
+    if (!response.ok) {
+      await response.body?.cancel();
+      return 'failed';
+    }
+    const body = (await response.json()) as { elements?: OverpassElement[]; remark?: string };
+    // A query that ran out of time or memory still answers 200, with a remark and partial data.
+    return Array.isArray(body.elements) && !body.remark?.includes('error') ? body.elements : 'failed';
   } catch (err) {
-    console.warn('Overpass request failed:', (err as Error).message);
+    console.warn(`Overpass ${mirror.id} failed:`, (err as Error).message);
+    return 'failed';
   }
-  if (!elements) {
-    if (failed) await store(env, cooldownKey(), '1', 'text/plain', COOLDOWN_SEC);
-    return null;
+}
+
+/**
+ * Parking for all `points` from the first server that answers, classified and cached; null if
+ * none did. Servers that don't cover the stations, or are paused after failing, are skipped.
+ */
+async function lookup(env: ParkingEnv, request: Request, points: Point[], waitUntil: (p: Promise<unknown>) => void) {
+  const started = Date.now();
+  for (const mirror of MIRRORS) {
+    if (Date.now() - started > LOOKUP_BUDGET_MS) break;
+    const url = mirror.endpoint(points);
+    if (!url) continue;
+    const health = parsed<Health>(await cached(env, healthKey(mirror)));
+    if (health && health.until > Date.now()) continue;
+
+    const answer = await ask(env, request, mirror, url, points, waitUntil);
+    if (answer === 'skipped') continue;
+    if (answer === 'failed') {
+      await store(env, healthKey(mirror), JSON.stringify(failed(health)), 'application/json', HEALTH_TTL_SEC);
+      continue;
+    }
+    if (health?.failures) await store(env, healthKey(mirror), JSON.stringify({ failures: 0, until: 0 }), 'application/json', HEALTH_TTL_SEC);
+    const infos = points.map((p) => classifyParking(p, answer));
+    await Promise.all(infos.map((info, i) => store(env, stationKey(points[i]), JSON.stringify(info), 'application/json', TTL_SEC)));
+    return { infos, mirror: mirror.id };
   }
-  const found = elements;
-  const infos = points.map((p) => classifyParking(p, found));
-  await Promise.all(infos.map((info, i) => store(env, stationKey(points[i]), JSON.stringify(info), 'application/json', TTL_SEC)));
-  return infos;
+  return null;
 }
 
 export async function onRequestPost({ request, env, waitUntil }: Context): Promise<Response> {
@@ -113,16 +159,7 @@ export async function onRequestPost({ request, env, waitUntil }: Context): Promi
   }
   if (!stations) return json({ error: `expected {"stations":[{"lat":…,"lon":…}]} with 1–${MAX_STATIONS} stations` }, 400);
 
-  const parking = await Promise.all(
-    stations.map(async (s) => {
-      const body = await cached(env, stationKey(s));
-      try {
-        return body ? (JSON.parse(body) as ParkingInfo) : undefined;
-      } catch {
-        return undefined;
-      }
-    }),
-  );
+  const parking = await Promise.all(stations.map(async (s) => parsed<ParkingInfo>(await cached(env, stationKey(s)))));
   const missing = stations.filter((_, i) => !parking[i]);
   if (!missing.length) return json({ parking }, 200, { [CACHE_HEADER]: 'HIT' });
 
@@ -131,6 +168,8 @@ export async function onRequestPost({ request, env, waitUntil }: Context): Promi
   waitUntil(pending);
   const found = await pending;
   let next = 0;
-  const filled = parking.map((p) => p ?? found?.[next++] ?? null);
-  return json(found ? { parking: filled } : { parking: filled, incomplete: true }, 200, { [CACHE_HEADER]: 'MISS' });
+  const filled = parking.map((p) => p ?? found?.infos[next++] ?? null);
+  return found
+    ? json({ parking: filled }, 200, { [CACHE_HEADER]: 'MISS', [MIRROR_HEADER]: found.mirror })
+    : json({ parking: filled, incomplete: true }, 200, { [CACHE_HEADER]: 'MISS' });
 }
