@@ -25,6 +25,8 @@ A **rideshare last leg** works the same way from the other end. The app finds up
 
 **Minimum stops on transit** (under Limits, default 3) drops trips that ride fewer stops, counting all transit legs together. Without it, a rideshare last leg can produce "drive to a station, ride one stop, rideshare the rest", which is only "fastest" on paper. When every trip Transitous returns for a station is too short and the last leg is a rideshare, the app asks once more without the stations those trips got off at, so the next-best station further down the line gets a chance. Set it to "any" to turn this off.
 
+**Legs that can't reach a station are skipped.** Before planning a walk, bike or share-bike leg, the app checks the station list for any station of the selected modes within a generous straight-line reach (5.5 km/h walking or 20 km/h biking for the leg's max time, plus 300 m). If there's none, it skips that combination's Transitous queries and says so in a note. Otherwise they'd be spent on trips that can't exist, such as walking 15 minutes to the San Diego Zoo from the nearest trolley stop.
+
 Walk-first and bike-first searches are a single Transitous query (plus the rideshare lookups if the last leg is a rideshare).
 
 With several modes selected, each first/last pairing is planned separately, because one combined query would only return the fastest mode. TomTom lookups, Transitous's park-and-ride pick and the rideshare stations are shared between pairings. Queries are kept to 3 at a time for Transitous and 2 for TomTom, and the server retries their "too many requests" responses.
@@ -215,6 +217,7 @@ Every `/api/*` route except login and logout requires a session cookie. The cook
 
 ## Known limitations
 
+- **Big searches are paced by Transitous.** In testing (November 2026), Transitous answered about the first 10 queries from a client at once, then one every 3 seconds (about 20 a minute), and recovered after a short pause. It delays queries rather than refusing them, so a search over that budget just takes longer: a 25-query search can take about 45 seconds. With the request queue, every query comes from the same Cloudflare Worker, so all users of a deployment share that pace. To keep searches quick, compare fewer stations, select fewer first/last leg modes, or set "Min stops on transit" to "any" (no retries). The estimate under **Find routes** shows how many queries a search can use.
 - **Coverage depends on Transitous.** For example, NCTD in San Diego County (Coaster, Sprinter, Breeze) isn't in Transitous yet, so those lines can't be routed. LA Metro, Metrolink, San Diego MTS, OCTA and Amtrak are covered, most with live data.
 - **"Own bike" doesn't restrict to bike-friendly trains**, because many feeds don't publish that data and enabling the filter returns no results. Check the agency's bike rules.
 - **Bike/scooter share** needs share-system data in Transitous, which many areas lack.

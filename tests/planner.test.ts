@@ -14,6 +14,8 @@ import {
   scoreStation,
   offsetsAvoiding,
   transitStops,
+  canReachStation,
+  reachKm,
 } from '../src/lib/planner';
 import type { LegCombo, MotisItinerary, MotisLeg, MotisPlace, PlanResponse, TripSettings } from '../src/lib/types';
 
@@ -426,5 +428,21 @@ describe('buildParkAndRideshareOption', () => {
 
     const arriveBy = buildParkAndRideshareOption({ ...request, arriveBy: true }, hub, d(1800), d(600));
     expect(arriveBy.endTime).toBe('2026-12-01T16:00:00.000Z');
+  });
+});
+
+describe('canReachStation', () => {
+  const zoo = { lat: 32.7353, lon: -117.149 };
+  const cityCollege = { lat: 32.7166, lon: -117.1544 }; // about 2.1 km away
+
+  it('rules out a walk that is too short to reach any station', () => {
+    expect(canReachStation([cityCollege], zoo, 'WALK', 15)).toBe(false);
+    expect(canReachStation([cityCollege], zoo, 'WALK', 25)).toBe(true);
+  });
+
+  it('gives bikes a longer reach and never rules out car legs', () => {
+    expect(canReachStation([cityCollege], zoo, 'BIKE', 10)).toBe(true);
+    expect(canReachStation([], zoo, 'RIDESHARE', 15)).toBe(true);
+    expect(reachKm('CAR_PARKING', 30)).toBeNull();
   });
 });

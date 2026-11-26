@@ -207,6 +207,26 @@ export function withinLimit(drives: Drive[], limitSec: number, fallback = 1): { 
   return { keep: shortest, relaxed: true };
 }
 
+// Generous straight-line speeds for walking and biking, used only to rule out legs that can't
+// reach any station (a station's map position can be a little off its platforms, hence the slack).
+const REACH_KMH: Record<string, number> = { WALK: 5.5, BIKE: 20, RENTAL: 20 };
+const REACH_SLACK_KM = 0.3;
+const REACH_WORDS: Record<string, string> = { WALK: 'walk', BIKE: 'bike ride', RENTAL: 'bike/scooter ride' };
+// Transitous's default limit for walking or biking the whole way (maxDirectTime).
+const DIRECT_MAX_MIN = 30;
+
+/** Straight-line reach of a walk/bike leg of `minutes`; null for modes without a fixed speed. */
+export function reachKm(mode: string, minutes: number): number | null {
+  const kmh = REACH_KMH[mode];
+  return kmh ? (kmh * minutes) / 60 + REACH_SLACK_KM : null;
+}
+
+/** Whether any of `stations` could be reached from `place` by `mode` within `minutes`. */
+export function canReachStation(stations: LatLon[], place: LatLon, mode: string, minutes: number): boolean {
+  const km = reachKm(mode, minutes);
+  return km === null || stations.some((s) => haversineKm(s, place) <= km);
+}
+
 /** Stops ridden on transit, over all of an itinerary's transit legs. */
 export function transitStops(it: MotisItinerary): number {
   return it.legs.reduce((n, l) => n + (STREET_MODES.has(l.mode) ? 0 : (l.intermediateStops?.length ?? 0) + 1), 0);
@@ -597,6 +617,10 @@ interface PlanContext extends PlanOptions {
   discovery(req: LegCombo, mode: string): Promise<PlanResponse | null>;
   /** Rideshare options from stations near the destination, computed once. */
   lastMile(): Promise<LastMile | undefined>;
+  /** Whether a walk/bike leg at the start or destination can reach a station at all. */
+  reaches(mode: string, minutes: number, end: 'start' | 'destination'): Promise<boolean>;
+  /** Note that trips with a leg that can't reach a station were skipped. */
+  skipped(mode: string, minutes: number, end: 'start' | 'destination'): void;
   stats: { tried: number; missing: number; tooShort: number };
 }
 
@@ -812,6 +836,7 @@ export async function planTrip(search: TripRequest, opts: PlanOptions): Promise<
   const notes: string[] = [];
   const driver = makeDriver({ ...opts, usage });
   const discoveries = new Map<string, Promise<PlanResponse | null>>();
+  const reachable = new Map<string, Promise<boolean>>();
   let lastMile: Promise<LastMile | undefined> | undefined;
   const ctx: PlanContext = {
     ...opts,
@@ -823,19 +848,49 @@ export async function planTrip(search: TripRequest, opts: PlanOptions): Promise<
     discovery(combo, mode) {
       let pending = discoveries.get(mode);
       if (!pending) {
-        pending = planQuery(ctx, {
-          ...baseParams({ ...combo, lastLeg: 'WALK' }),
-          preTransitModes: mode,
-          maxPreTransitTime: req.maxFirstLegMin * 60,
-        }).catch((err) => {
-          rethrowIfFatal(err, opts.signal);
-          return null;
-        });
+        // It asks for a walking last leg, so it can't find anything if no station is in walking range.
+        pending = ctx
+          .reaches('WALK', req.maxLastLegMin, 'destination')
+          .then((walkable) =>
+            walkable
+              ? planQuery(ctx, {
+                  ...baseParams({ ...combo, lastLeg: 'WALK' }),
+                  preTransitModes: mode,
+                  maxPreTransitTime: req.maxFirstLegMin * 60,
+                })
+              : null,
+          )
+          .catch((err) => {
+            rethrowIfFatal(err, opts.signal);
+            return null;
+          });
         discoveries.set(mode, pending);
       }
       return pending;
     },
     lastMile: () => (lastMile ??= prepareRideshareLastMile(req, driver, notes, opts.signal)),
+    reaches(mode, minutes, end) {
+      const km = reachKm(mode, minutes);
+      if (km === null) return Promise.resolve(true);
+      const key = `${end}:${mode}:${minutes}`;
+      let pending = reachable.get(key);
+      if (!pending) {
+        const place = end === 'start' ? req.from : req.to;
+        // Station tiles are cached and don't count toward any limit, unlike the plan queries this saves.
+        pending = stationsNear(place, km, motisTransitModes(req.transit)).then(
+          (stations) => canReachStation(stations, place, mode, minutes),
+          (err) => {
+            rethrowIfFatal(err, opts.signal);
+            return true;
+          },
+        );
+        reachable.set(key, pending);
+      }
+      return pending;
+    },
+    skipped(mode, minutes, end) {
+      notes.push(`No stations within a ${minutes}-minute ${REACH_WORDS[mode]} of the ${end}, so those trips were skipped.`);
+    },
   };
 
   const combos: LegCombo[] = req.firstLegs.flatMap((firstLeg) => req.lastLegs.map((lastLeg) => ({ ...req, firstLeg, lastLeg })));
@@ -874,6 +929,15 @@ interface ComboResult {
 
 async function planStreetFirst(req: LegCombo, ctx: PlanContext): Promise<ComboResult> {
   ctx.onProgress?.('Planning…');
+  const [startOk, endOk] = await Promise.all([
+    ctx.reaches(req.firstLeg, req.maxFirstLegMin, 'start'),
+    ctx.reaches(req.lastLeg, req.maxLastLegMin, 'destination'),
+  ]);
+  // Without transit the query can still find a walk or ride the whole way, if the trip is short.
+  if (!startOk) ctx.skipped(req.firstLeg, req.maxFirstLegMin, 'start');
+  if (!endOk) ctx.skipped(req.lastLeg, req.maxLastLegMin, 'destination');
+  const directKm = reachKm(req.firstLeg, DIRECT_MAX_MIN) ?? 0;
+  if (!(startOk && endOk) && haversineKm(req.from, req.to) > directKm) return { options: [], direct: [] };
   const lastMile = req.lastLeg === 'RIDESHARE' ? await ctx.lastMile() : undefined;
   if (req.lastLeg === 'RIDESHARE' && !lastMile) return { options: [], direct: [] };
   let res: PlanResponse;
@@ -917,7 +981,17 @@ async function planCarFirst(req: LegCombo, ctx: PlanContext): Promise<ComboResul
   const maxKm = maxDriveKm(req.maxFirstLegMin);
   const anchor = req.time ?? new Date();
 
+  // Departure times ignore the rideshare pickup wait so all car modes share the same lookups.
+  const departureFor = (estimatedTripSec: number) => (req.arriveBy ? addSec(anchor, -estimatedTripSec) : anchor);
+  const directCar = async () => [
+    directCarOption(req, await driver.route(req.from, req.to, departureFor(estimateDrive(req.from, req.to).seconds))),
+  ];
+
   onProgress?.('Finding stations…');
+  if (!(await ctx.reaches(req.lastLeg, req.maxLastLegMin, 'destination'))) {
+    ctx.skipped(req.lastLeg, req.maxLastLegMin, 'destination');
+    return { options: [], direct: await directCar() };
+  }
   const [discovery, nearby, lastMile] = await Promise.all([
     // Transitous has no rideshare mode; a drop-off has the same shape.
     ctx.discovery(req, req.firstLeg === 'RIDESHARE' ? 'CAR_DROPOFF' : req.firstLeg),
@@ -930,10 +1004,7 @@ async function planCarFirst(req: LegCombo, ctx: PlanContext): Promise<ComboResul
     }),
     req.lastLeg === 'RIDESHARE' ? ctx.lastMile() : Promise.resolve(undefined),
   ]);
-  // Departure times ignore the rideshare pickup wait so all car modes share the same lookups.
-  const departureFor = (estimatedTripSec: number) => (req.arriveBy ? addSec(anchor, -estimatedTripSec) : anchor);
-  const directDrive = driver.route(req.from, req.to, departureFor(estimateDrive(req.from, req.to).seconds));
-  const direct = [directCarOption(req, await directDrive)];
+  const direct = await directCar();
   if (req.lastLeg === 'RIDESHARE' && !lastMile) return { options: [], direct };
 
   const discovered = discovery ? discoveryCandidates(discovery, req.from, req.to) : [];
