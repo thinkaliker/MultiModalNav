@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { fmtDuration, fmtTime } from '../lib/format';
+  import { fmtDuration, fmtTime, parkingLabel } from '../lib/format';
   import type { TripOption } from '../lib/types';
   import LegChips from './LegChips.svelte';
 
@@ -38,6 +38,9 @@
             {opt.traffic.label} {fmtDuration(opt.traffic.driveSec)}{opt.traffic.delaySec >= 60 ? ` incl. ${fmtDuration(opt.traffic.delaySec)} traffic delay` : ', light traffic'}
           {/if}
         </div>
+      {/if}
+      {#if opt.parking}
+        <div class="parking {opt.parking.status}">🅿️ {parkingLabel(opt.parking)}</div>
       {/if}
     </button>
     <button type="button" class="details" onclick={() => onopen(opt.id)} aria-label="Show details">›</button>
@@ -136,8 +139,17 @@
     font-size: 0.85rem;
     color: var(--muted);
   }
-  .traffic.warn {
+  .traffic.warn,
+  .parking.paid,
+  .parking.none {
     color: #b45309;
+  }
+  .parking {
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  .parking.free {
+    color: #15803d;
   }
   .live {
     color: #16a34a;

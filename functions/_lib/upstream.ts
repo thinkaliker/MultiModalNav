@@ -1,6 +1,17 @@
-import type { Env } from './env';
-import { guardUpstream } from './ratelimit';
+import { guardUpstream, type RateEnv } from './ratelimit';
 import { fetchWithRetry, GATE_HEADER, REJECTED_HEADER, type CacheOptions, type GateJob, type Service } from './upstream-common';
+
+/** The parts of the GATE Durable Object binding used here. */
+export interface GateBinding {
+  idFromName(name: string): unknown;
+  get(id: unknown): { fetch(url: string, init: { method: string; body: string }): Promise<Response> };
+}
+
+export interface UpstreamEnv extends RateEnv {
+  GATE?: GateBinding;
+  TOMTOM_MAX_IN_FLIGHT?: string;
+  TRANSITOUS_MAX_IN_FLIGHT?: string;
+}
 
 export interface UpstreamCall {
   service: Service;
@@ -9,6 +20,7 @@ export interface UpstreamCall {
   headers: Record<string, string>;
   body?: string;
   cf?: CacheOptions;
+  timeoutMs?: number;
 }
 
 export interface UpstreamResult {
@@ -19,7 +31,8 @@ export interface UpstreamResult {
   via: 'gate' | 'limiter';
 }
 
-const DEFAULT_IN_FLIGHT: Record<Service, number> = { tomtom: 2, transitous: 3 };
+// Overpass is a volunteer server whose terms ask apps to limit simultaneous requests.
+const DEFAULT_IN_FLIGHT: Record<Service, number> = { tomtom: 2, transitous: 3, overpass: 1 };
 const QUEUE_MAX_WAIT_MS = 15_000;
 
 function positive(value: string | undefined, fallback: number): number {
@@ -32,12 +45,12 @@ function positive(value: string | undefined, fallback: number): number {
  * Durable Object is bound and reachable, otherwise through the D1 per-second limiter.
  */
 export async function callUpstream(
-  env: Env,
+  env: UpstreamEnv,
   request: Request,
   call: UpstreamCall,
   waitUntil: (promise: Promise<unknown>) => void,
 ): Promise<UpstreamResult> {
-  const init = { method: call.method ?? 'GET', headers: call.headers, body: call.body, cf: call.cf };
+  const init = { method: call.method ?? 'GET', headers: call.headers, body: call.body, cf: call.cf, timeoutMs: call.timeoutMs };
 
   if (env.GATE) {
     const job: GateJob = {
@@ -48,11 +61,15 @@ export async function callUpstream(
       headers: call.headers,
       body: call.body,
       cf: call.cf,
+      timeoutMs: call.timeoutMs,
       limits: {
-        inFlight: positive(
-          call.service === 'tomtom' ? env.TOMTOM_MAX_IN_FLIGHT : env.TRANSITOUS_MAX_IN_FLIGHT,
-          DEFAULT_IN_FLIGHT[call.service],
-        ),
+        inFlight:
+          call.service === 'overpass'
+            ? DEFAULT_IN_FLIGHT.overpass
+            : positive(
+                call.service === 'tomtom' ? env.TOMTOM_MAX_IN_FLIGHT : env.TRANSITOUS_MAX_IN_FLIGHT,
+                DEFAULT_IN_FLIGHT[call.service],
+              ),
         clientPerMinute: positive(env.CLIENT_MAX_PER_MINUTE, 120),
         maxWaitMs: QUEUE_MAX_WAIT_MS,
       },

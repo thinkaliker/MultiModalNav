@@ -65,7 +65,7 @@
 </fieldset>
 
 <details class="limits">
-  <summary>Limits</summary>
+  <summary>More options</summary>
   <label>
     <span>Max {onlyCar ? 'drive' : 'first leg'}: {settings.maxFirstLegMin} min</span>
     <input type="range" min="5" max="60" step="5" bind:value={settings.maxFirstLegMin} />
@@ -88,6 +88,10 @@
     <label>
       <span>Parking + walk to platform: {settings.parkBufferMin} min</span>
       <input type="range" min="0" max="20" step="1" bind:value={settings.parkBufferMin} />
+    </label>
+    <label class="check">
+      <input type="checkbox" bind:checked={settings.prioritizeFreeParking} />
+      <span>Prioritize free parking <span class="hint">(station lots from OpenStreetMap)</span></span>
     </label>
   {/if}
   {#if anyCar}
@@ -130,5 +134,13 @@
     gap: 0.15rem;
     margin-top: 0.5rem;
     font-size: 0.85rem;
+  }
+  .limits label.check {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .check .hint {
+    color: var(--muted);
   }
 </style>

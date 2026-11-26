@@ -38,7 +38,7 @@ export const onRequest: PagesFunction<Env, 'path'> = async ({ request, params, e
   const url = new URL(UPSTREAM + path);
   url.search = new URL(request.url).search;
 
-  const headers: Record<string, string> = { 'User-Agent': userAgent(env.TRANSITOUS_CONTACT), Accept: 'application/json' };
+  const headers: Record<string, string> = { 'User-Agent': userAgent(env.MULTIMODALNAV_CONTACT), Accept: 'application/json' };
   let body: string | undefined;
   let cf: CacheOptions | undefined;
   if (request.method === 'POST') {

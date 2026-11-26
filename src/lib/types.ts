@@ -125,6 +125,9 @@ export interface SearchUsage extends UpstreamCounts {
   cached: number;
 }
 
+export type { ParkingInfo, ParkingLot, ParkingStatus } from '../../functions/_lib/parking';
+import type { ParkingInfo } from '../../functions/_lib/parking';
+
 // App model.
 export interface LatLon {
   lat: number;
@@ -150,6 +153,8 @@ export interface TripSettings {
   stationsToCompare: number;
   /** Trips riding fewer stops than this (all transit legs together) are dropped. */
   minTransitStops: number;
+  /** Look up parking at stations (OpenStreetMap) and favour ones with free public lots. */
+  prioritizeFreeParking: boolean;
 }
 
 export interface TripRequest extends TripSettings {
@@ -206,4 +211,8 @@ export interface TripOption {
   alternatives: { startTime: string; endTime: string }[];
   traffic?: { label: 'Drive' | 'Ride'; driveSec: number; delaySec: number; estimated: boolean };
   realTime: boolean;
+  /** Parking where this option leaves the car, when it was looked up. */
+  parking?: ParkingInfo;
+  /** Seconds counted against this option when ranking, beyond its time (paid parking, say). */
+  penaltySec?: number;
 }

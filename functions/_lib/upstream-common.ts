@@ -2,7 +2,7 @@
 
 import { json } from './http';
 
-export type Service = 'tomtom' | 'transitous';
+export type Service = 'tomtom' | 'transitous' | 'overpass';
 
 /** Edge-cache options for a request (the subset of Cloudflare's `cf` options used here). */
 export interface CacheOptions {
@@ -15,12 +15,15 @@ export interface UpstreamInit {
   headers?: Record<string, string>;
   body?: string;
   cf?: CacheOptions;
+  /** Give up on an upstream that doesn't answer within this long. */
+  timeoutMs?: number;
 }
 
 export type Fetcher = (url: string, init: UpstreamInit) => Promise<Response>;
 
 // Cloudflare's fetch accepts `cf` cache options; the cast bridges the DOM and Workers typings.
-const platformFetch: Fetcher = (url, init) => fetch(url, init as unknown as RequestInit);
+const platformFetch: Fetcher = (url, { timeoutMs, ...init }) =>
+  fetch(url, { ...init, signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined } as unknown as RequestInit);
 
 /** One upstream request handed to the gate. */
 export interface GateJob {
@@ -32,6 +35,7 @@ export interface GateJob {
   headers: Record<string, string>;
   body?: string;
   cf?: CacheOptions;
+  timeoutMs?: number;
   limits: {
     /** Requests to this service in flight at once, across all clients. */
     inFlight: number;
@@ -107,7 +111,7 @@ export class GateCore {
     try {
       const res = await fetchWithRetry(
         job.url,
-        { method: job.method, headers: job.headers, body: job.body, cf: job.cf },
+        { method: job.method, headers: job.headers, body: job.body, cf: job.cf, timeoutMs: job.timeoutMs },
         this.fetcher,
       );
       // The slot is freed once headers arrive; the body streams on without holding it.

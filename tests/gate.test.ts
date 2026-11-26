@@ -102,6 +102,18 @@ describe('GateCore', () => {
   });
 });
 
+describe('GateCore timeouts', () => {
+  it('passes a job\'s timeout on to the upstream fetch', async () => {
+    const seen: UpstreamInit[] = [];
+    const gate = new GateCore(async (_url, init) => {
+      seen.push(init);
+      return new Response('{}');
+    });
+    await gate.handle(job({ service: 'overpass', timeoutMs: 20_000 }));
+    expect(seen[0].timeoutMs).toBe(20_000);
+  });
+});
+
 describe('fetchWithRetry', () => {
   it('retries "too many requests" and returns the eventual answer', async () => {
     const statuses = [429, 200];

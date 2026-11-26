@@ -13,6 +13,8 @@ import type {
   MotisLeg,
   MotisPlace,
   NamedPlace,
+  ParkingInfo,
+  ParkingStatus,
   PlanResponse,
   SearchUsage,
   TomTomRouteResponse,
@@ -47,6 +49,15 @@ export const RIDESHARE_COST_FACTOR = 1;
 const MIN_COMPARED_STATIONS = 2;
 // TomTom lookups per search for leaving transit early (see preferEarlyExits).
 const MAX_EXIT_LOOKUPS = 4;
+/** With free parking a priority: seconds counted against a station for its parking, when ranking. */
+export const PARKING_PENALTY_SEC: Record<ParkingStatus, number> = { free: 0, unknown: 5 * 60, paid: 15 * 60, none: 15 * 60 };
+// With free parking a priority, this many more stations are checked before choosing which to compare.
+const PARKING_EXTRA_PICKS = 4;
+// A search doesn't wait longer than this for parking data; it compares stations without it.
+const PARKING_WAIT_MS = 6000;
+
+/** What a station's parking counts for (nothing if it couldn't be looked up). */
+export const parkingPenaltySec = (info?: ParkingInfo) => (info ? PARKING_PENALTY_SEC[info.status] : 0);
 
 export interface Candidate {
   key: string;
@@ -140,6 +151,8 @@ export function pickCandidates(
   maxKm: number,
   count: number,
   closest = 0,
+  /** Extra seconds against a station (its parking, say) when choosing between stations. */
+  penaltySec: (c: Candidate) => number = () => 0,
 ): Candidate[] {
   const ranked: Candidate[] = [];
   for (const s of nearby) {
@@ -158,7 +171,8 @@ export function pickCandidates(
       modes: s.modes,
     });
   }
-  ranked.sort((a, b) => a.estimateSec - b.estimateSec);
+  const rank = (c: Candidate) => c.estimateSec + penaltySec(c);
+  ranked.sort((a, b) => rank(a) - rank(b));
 
   // Spread picks along the corridor (near home, midway, near the destination) so the
   // comparison isn't dominated by one stretch of line; the rough estimate can't be trusted
@@ -182,7 +196,7 @@ export function pickCandidates(
   const take = (c: Candidate | undefined) => {
     if (c && picked.length < count && !isDuplicate(c)) picked.push(c);
   };
-  discovered.forEach(take);
+  [...discovered].sort((a, b) => penaltySec(a) - penaltySec(b)).forEach(take);
   // The `closest` stations to `from` first, then the spread along the corridor.
   [...ranked]
     .sort((a, b) => haversineKm(from, a.station) - haversineKm(from, b.station))
@@ -307,9 +321,9 @@ export function tripCost(arriveBy: boolean, startTime: string, endTime: string, 
 
 const rideshareSec = (o: TripOption) => o.legs.reduce((n, l) => n + (l.mode === 'RIDESHARE' ? l.durationSec : 0), 0);
 
-/** `tripCost` of an option, counting its rideshare minutes (see RIDESHARE_COST_FACTOR). */
+/** `tripCost` of an option, counting its rideshare minutes (see RIDESHARE_COST_FACTOR) and penalties. */
 export const optionCost = (arriveBy: boolean, o: TripOption) =>
-  tripCost(arriveBy, o.startTime, o.endTime, o.transfers, RIDESHARE_COST_FACTOR * rideshareSec(o));
+  tripCost(arriveBy, o.startTime, o.endTime, o.transfers, RIDESHARE_COST_FACTOR * rideshareSec(o) + (o.penaltySec ?? 0));
 
 /** A copy of `it` starting `sec` later, its first (injected) leg that much shorter. */
 export function startLater(it: MotisItinerary, sec: number): MotisItinerary {
@@ -366,9 +380,10 @@ const finalRideSec = (o: TripOption) => {
 export function slowerThanParkAndRideshare(option: TripOption, parkAndRideshare: TripOption): boolean {
   const ride = finalRideSec(option);
   const drive = option.traffic?.driveSec ?? 0;
+  const cost = (o: TripOption) => o.durationSec + (o.penaltySec ?? 0);
   return (
     ride > 0 &&
-    option.durationSec >= parkAndRideshare.durationSec + DOMINANCE_MARGIN_SEC &&
+    cost(option) >= cost(parkAndRideshare) + DOMINANCE_MARGIN_SEC &&
     finalRideSec(parkAndRideshare) <= ride + TRANSFER_PENALTY_SEC &&
     (parkAndRideshare.traffic?.driveSec ?? Infinity) <= drive + TRANSFER_PENALTY_SEC
   );
@@ -821,6 +836,8 @@ interface PlanContext extends PlanOptions {
   skipped(mode: string, minutes: number, end: 'start' | 'destination'): void;
   /** A rideshare from a transfer station to the destination; null once the lookup budget is spent. */
   exitRide(place: MotisPlace, departure: Date): Promise<Drive | null>;
+  /** Parking at each station (OpenStreetMap), looked up once per search; undefined if unavailable. */
+  parking(stations: LatLon[]): Promise<(ParkingInfo | undefined)[]>;
   stats: { tooShort: number };
 }
 
@@ -867,9 +884,9 @@ function planQuery(ctx: PlanContext, params: PlanParams, offsets?: Offsets): Pro
 /**
  * A plan query keeping only sensible trips: ones that ride at least `minTransitStops` stops and
  * don't loop back through a station. If none are left, ask once more without the stations the
- * others used: their boarding stations (`retryWithout: 'boarding'`, for a station list the app
- * chose) or the stations they got off at for a rideshare. The next-best is usually further along
- * the line. `tooShort` says there were trips, but none rode far enough; `short` lists every trip
+ * others used: their boarding stations (`retryWithout: 'boarding'`; the next-best is usually
+ * further up the line) or the stations they got off at for a rideshare (`'exit'`, so they ride
+ * further). `tooShort` says there were trips, but none rode far enough; `short` lists every trip
  * dropped.
  */
 async function planTransit(
@@ -896,6 +913,15 @@ async function planTransit(
   }
   const tooShort = !kept.itineraries.length && short.some((it) => transitStops(it) < req.minTransitStops);
   return { plan: kept, tooShort, short };
+}
+
+/** `promise`, or a rejection once `ms` have passed without it settling. */
+function within<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('timed out')), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 function rethrowIfFatal(err: unknown, signal?: AbortSignal) {
@@ -1127,6 +1153,7 @@ export async function planTrip(search: TripRequest, opts: PlanOptions): Promise<
   const discoveries = new Map<string, Promise<PlanResponse | null>>();
   const reachable = new Map<string, Promise<boolean>>();
   const exitRides = new Map<string, Promise<Drive>>();
+  const parkingAt = new Map<string, Promise<ParkingInfo | undefined>>();
   let lastMile: Promise<LastMile | undefined> | undefined;
   const ctx: PlanContext = {
     ...opts,
@@ -1192,6 +1219,28 @@ export async function planTrip(search: TripRequest, opts: PlanOptions): Promise<
       }
       return pending;
     },
+    parking(stations) {
+      const key = (p: LatLon) => `${p.lat.toFixed(4)},${p.lon.toFixed(4)}`;
+      const todo = [...new Map(stations.filter((s) => !parkingAt.has(key(s))).map((s) => [key(s), s])).values()];
+      if (todo.length) {
+        const unavailable = () =>
+          notes.push('Couldn’t get parking data from OpenStreetMap just now, so some stations were compared without it.');
+        // A slow answer is still cached by the server for the next search.
+        const batch = within(api.parking(todo, opts.signal), PARKING_WAIT_MS).then(
+          ({ data }) => {
+            if (data.incomplete) unavailable();
+            return data.parking;
+          },
+          (err) => {
+            rethrowIfFatal(err, opts.signal);
+            unavailable();
+            return [] as (ParkingInfo | null)[];
+          },
+        );
+        todo.forEach((s, i) => parkingAt.set(key(s), batch.then((list) => list[i] ?? undefined)));
+      }
+      return Promise.all(stations.map((s) => parkingAt.get(key(s))!));
+    },
   };
 
   const combos: LegCombo[] = req.firstLegs.flatMap((firstLeg) => req.lastLegs.map((lastLeg) => ({ ...req, firstLeg, lastLeg })));
@@ -1222,7 +1271,7 @@ export async function planTrip(search: TripRequest, opts: PlanOptions): Promise<
   if (driver.failed && usesCar(req)) notes.push(driver.note);
   if (ctx.stats.tooShort) {
     const n = ctx.stats.tooShort;
-    notes.push(`Hid ${n} option${n > 1 ? 's' : ''} riding fewer than ${req.minTransitStops} stops on transit (see Limits).`);
+    notes.push(`Hid ${n} option${n > 1 ? 's' : ''} riding fewer than ${req.minTransitStops} stops on transit (see More options).`);
   }
   if (all.length > MAX_OPTIONS) notes.push(`Showing the ${MAX_OPTIONS} best of ${all.length} options.`);
   if (!all.length && candidates.length === results.flatMap((r) => r.options).length) {
@@ -1287,6 +1336,10 @@ async function planStreetFirst(req: LegCombo, ctx: PlanContext): Promise<ComboRe
   };
 }
 
+/** A station candidate parking at the lot its parking info names, instead of at the platform. */
+export const atLot = (c: Candidate, info?: ParkingInfo): Candidate =>
+  c.source === 'nearby' && info?.lot ? { ...c, park: { lat: info.lot.lat, lon: info.lot.lon } } : c;
+
 async function planCarFirst(req: LegCombo, ctx: PlanContext): Promise<ComboResult> {
   const { trafficEnabled, signal, onProgress, driver } = ctx;
   const base = baseParams(req);
@@ -1328,14 +1381,30 @@ async function planCarFirst(req: LegCombo, ctx: PlanContext): Promise<ComboResul
   const usable = (station: LatLon, stopId?: string) =>
     !lastMile || (!pickups.has(stopId ?? '') && estimateDrive(station, req.to).seconds * scale > req.maxLastLegMin * 60);
   const discovered = (discovery ? discoveryCandidates(discovery, req.from, req.to) : []).filter((c) => usable(c.station, c.stopId));
-  const nearbyPicks = pickCandidates(
-    nearby.filter((s) => usable(s, s.stopId)),
-    discovered,
-    req.from,
-    req.to,
-    maxKm,
-    req.stationsToCompare,
-  );
+  const usableNearby = nearby.filter((s) => usable(s, s.stopId));
+  // With free parking a priority, look a little wider, then choose again with parking counted.
+  const prioritizeParking = req.firstLeg === 'CAR_PARKING' && req.prioritizeFreeParking;
+  const extra = prioritizeParking ? PARKING_EXTRA_PICKS : 0;
+  let nearbyPicks = pickCandidates(usableNearby, discovered, req.from, req.to, maxKm, req.stationsToCompare + extra);
+  const parking = new Map<string, ParkingInfo>();
+  if (prioritizeParking && nearbyPicks.length) {
+    onProgress?.('Checking parking at stations…');
+    const infos = await ctx.parking(nearbyPicks.map((c) => c.station));
+    nearbyPicks.forEach((c, i) => infos[i] && parking.set(c.key, infos[i]));
+    const wider = new Set(nearbyPicks.map((c) => c.key));
+    nearbyPicks = parking.size
+      ? pickCandidates(
+          usableNearby.filter((s) => wider.has(s.stopId ?? '')),
+          discovered.filter((c) => wider.has(c.key)),
+          req.from,
+          req.to,
+          maxKm,
+          req.stationsToCompare,
+          0,
+          (c) => parkingPenaltySec(parking.get(c.key)),
+        ).map((c) => atLot(c, parking.get(c.key)))
+      : nearbyPicks.slice(0, req.stationsToCompare);
+  }
   if (!nearbyPicks.length) {
     ctx.notes.push(
       lastMile && nearby.length
@@ -1352,16 +1421,29 @@ async function planCarFirst(req: LegCombo, ctx: PlanContext): Promise<ComboResul
   const candidates = keep.map((i) => nearbyPicks[i]);
   const drives = keep.map((i) => allDrives[i]);
 
-  let pool = candidates.map((_, i) => i);
+  const all = candidates.map((_, i) => i);
+  // Stations with free parking get a query of their own first, so others can't crowd them out
+  // of Transitous's answer (it picks the fastest, parking aside); the rest follow for comparison.
+  const free = all.filter((i) => parking.get(candidates[i].key)?.status === 'free');
+  let freeFirst = free.length > 0 && free.length < all.length;
+  let pool = freeFirst ? free : all;
 
-  onProgress?.(`Planning transit from ${pool.length} stations…`);
+  onProgress?.(`Planning transit from ${all.length} stations…`);
   const bufferSec = firstLegBufferSec(req);
   const offsetSec = (i: number) => drives[i].seconds + bufferSec + candidates[i].walkSec;
-  // What Transitous sees on top of the real first leg: a rideshare's cost, as for the last leg.
-  const weightSec = (i: number) => (req.firstLeg === 'RIDESHARE' && !req.arriveBy ? Math.round(drives[i].seconds * RIDESHARE_COST_FACTOR) : 0);
+  const penaltySec = (i: number) => parkingPenaltySec(parking.get(candidates[i].key));
+  // What Transitous sees on top of the real first leg: a rideshare's cost, as for the last leg,
+  // or what the parking costs. Only for "arrive by", where it just means leaving earlier: when
+  // leaving at a set time, a longer first leg would also change which trains can be caught.
+  const weightSec = (i: number) => {
+    if (!req.arriveBy) return 0;
+    return req.firstLeg === 'RIDESHARE' ? Math.round(drives[i].seconds * RIDESHARE_COST_FACTOR) : penaltySec(i);
+  };
   // One query covers every station: Transitous searches from all of them at once, each weighted
   // by its drive. If the answers use fewer than MIN_COMPARED_STATIONS stations, ask once more
-  // without the ones already covered, so there's a comparison.
+  // without the ones already covered, so there's a comparison. Trips riding too few stops are
+  // retried without the stations they got off at for a rideshare (so they ride further), or
+  // without the stations they boarded at otherwise.
   const found = new Map<number, TripOption>();
   for (let round = 0; round < 2 && pool.length; round++) {
     let result: Awaited<ReturnType<typeof planTransit>>;
@@ -1374,7 +1456,7 @@ async function planCarFirst(req: LegCombo, ctx: PlanContext): Promise<ComboResul
           fromOffsets: pool.map((i) => ({ stopId: candidates[i].stopId, duration: offsetSec(i) + weightSec(i), mode: 'CAR' as const })),
           toOffsets: lastMile?.offsets,
         },
-        'boarding',
+        lastMile ? 'exit' : 'boarding',
       );
     } catch (err) {
       rethrowIfFatal(err, signal);
@@ -1391,13 +1473,16 @@ async function planCarFirst(req: LegCombo, ctx: PlanContext): Promise<ComboResul
     for (const [j, group] of groupByBoarding(its, stations)) {
       const i = pool[j];
       const option = buildParkRideOption(req, candidates[i], drives[i], offsetSec(i), { ...result.plan, itineraries: group }, lastMile);
-      if (option) found.set(i, option);
+      const info = parking.get(candidates[i].key);
+      if (option) found.set(i, info ? { ...option, parking: info, penaltySec: penaltySec(i) } : option);
     }
     // Stations already answered, or whose trips were too short or not worth it, won't give anything new.
     const used = new Set([...groupByBoarding([...result.short, ...dropped], stations).keys()].map((j) => pool[j]));
-    const next = pool.filter((i) => !found.has(i) && !used.has(i));
-    if (found.size >= MIN_COMPARED_STATIONS || next.length === pool.length) break;
+    const next = all.filter((i) => !found.has(i) && !used.has(i));
+    const compared = found.size >= MIN_COMPARED_STATIONS && !freeFirst;
+    if (compared || !next.length || (next.length === pool.length && next.every((i) => pool.includes(i)))) break;
     pool = next;
+    freeFirst = false;
   }
   return { options: [...found.values()], direct };
 }
@@ -1410,6 +1495,7 @@ async function planParkAndRideshare(req: TripRequest, ctx: PlanContext): Promise
   const lastMile = await ctx.lastMile();
   if (!lastMile) return undefined;
   const anchor = req.time ?? new Date();
+  const parking = req.prioritizeFreeParking ? await ctx.parking(lastMile.candidates.map((c) => c.station)) : [];
   const options = await Promise.all(
     lastMile.candidates.map(async (hub, i) => {
       const ride = lastMile.drives[i];
@@ -1417,7 +1503,9 @@ async function planParkAndRideshare(req: TripRequest, ctx: PlanContext): Promise
         ? addSec(anchor, -(estimateDrive(req.from, hub.station).seconds + lastMile.waitSec + ride.seconds))
         : anchor;
       const drive = await ctx.driver.route(req.from, hub.station, departure);
-      return buildParkAndRideshareOption(req, hub, drive, ride);
+      const option = buildParkAndRideshareOption(req, hub, drive, ride);
+      const info = parking[i];
+      return info ? { ...option, parking: info, penaltySec: parkingPenaltySec(info) } : option;
     }),
   );
   return sortOptions(options, req.arriveBy)[0];

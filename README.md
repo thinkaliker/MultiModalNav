@@ -9,17 +9,18 @@ A park-and-ride and multimodal trip planner, built as an installable web app (PW
 | Map | [OpenFreeMap](https://openfreemap.org) + MapLibre GL | No key needed |
 | Transit, walk and bike routing, stations, place search | [Transitous](https://transitous.org) (MOTIS 2 API) | No key; worldwide community GTFS/GTFS-RT feeds |
 | Driving with traffic | [TomTom Routing API](https://developer.tomtom.com) | Free tier, key kept server-side |
+| Parking at stations | OpenStreetMap via the [Private.coffee Overpass API](https://overpass.private.coffee/) | No key; only with "Prioritize free parking" |
 | Hosting, API proxy, password | Cloudflare Pages + Functions | |
 
 A drive-first search:
 
 1. Asks Transitous for its own park-and-ride trip (that gives a real parking lot and the walk to the platform), and loads stations near the start that serve the selected transit modes.
-2. Picks up to *N* candidate stations spread along the corridor to the destination (near home, midway, near the destination).
+2. Picks up to *N* candidate stations spread along the corridor to the destination (near home, midway, near the destination). With **Prioritize free parking** on, it looks at 4 more and chooses again with their parking counted (see [Free parking](#free-parking)).
 3. Gets a traffic-aware drive time to each station from TomTom.
 4. Plans the transit part from **all the stations in one Transitous query**. Each station goes in as a possible start (`fromOffsets`), weighted by its drive time plus a parking buffer, so Transitous's own route search chooses between them. Transitous's own drive times ignore traffic, so these weights are what make the ranking reflect rush hour. If the answers use only one station, the app asks once more without it, so there's a comparison.
 5. Ranks the options by arrival time plus **5 minutes per transfer** (or by latest departure for "arrive by"), next to a drive-the-whole-way option. Another line has to save more than 5 minutes to win. An option is hidden if another leaves within 5 minutes of it and still comes out at least 15 minutes ahead.
 
-**Rideshare minutes count double** (they cost money): in the ranking, and in what Transitous optimizes, since each rideshare station goes into the query with its ride time counted twice. A longer rideshare has to save real time to be chosen, so the planner doesn't end a trip with a long rideshare just to save a few minutes. The times shown are always the real ones. "Arrive by" searches send real times, so you're not told to leave earlier than needed.
+**Rideshare minutes count double** (they cost money): in the ranking, and in what Transitous optimizes. A rideshare last leg goes into the query with its ride time counted twice when you leave at a set time; a rideshare first leg does when you arrive by a set time. (The other way round, the extra minutes would change which trains can be caught.) A longer rideshare has to save real time to be chosen, so the planner doesn't end a trip with a long rideshare just to save a few minutes. The times shown are always the real ones.
 
 When picking stations, the app skips one within 1 km of a station it already picked on the same kind of line (two neighbouring trolley stops, say), so the comparison covers more ground.
 
@@ -29,7 +30,7 @@ A **rideshare last leg** works the same way from the other end. The app finds up
 
 **Leaving transit early.** When a rideshare-last trip changes lines, the app compares getting off at the transfer station and riding from there. It screens each transfer station with a distance estimate scaled to the TomTom rides it already has, and gets a real TomTom time only for promising ones (at most 4 per search, and no extra Transitous queries). The second line stays only if it saves more than the transfer penalty, so "Balboa Avenue, Blue Line to Old Town, Green Line to Mission Valley, rideshare to the Zoo" becomes "Balboa Avenue, Blue Line to Old Town, rideshare from there". If getting off early would win but would ride fewer than the minimum stops, the trip isn't worth taking either way and is dropped.
 
-**Trips that loop back** through a station they already passed (say, one stop out and one stop back before a rideshare) are always dropped. **Minimum stops on transit** (under Limits, default 3) drops trips that ride fewer stops, counting all transit legs together. Without it, a rideshare last leg can produce "drive to a station, ride one stop, rideshare the rest", which is only "fastest" on paper. When every trip Transitous returns is too short, the app asks once more without the stations those trips used: their boarding stations for drive-first trips, or the stations they got off at for a walk- or bike-first trip with a rideshare last leg. Set it to "any" to turn this off.
+**Trips that loop back** through a station they already passed (say, one stop out and one stop back before a rideshare) are always dropped. **Minimum stops on transit** (under More options, default 3) drops trips that ride fewer stops, counting all transit legs together. Without it, a rideshare last leg can produce "drive to a station, ride one stop, rideshare the rest", which is only "fastest" on paper. When every trip Transitous returns is too short, the app asks once more without the stations those trips used. With a rideshare last leg, those are the stations they got off at, so the trip rides further from the same station. Otherwise they're the boarding stations, so it starts further up the line. Set it to "any" to turn this off.
 
 **Legs that can't reach a station are skipped.** Before planning a walk, bike or share-bike leg, the app checks the station list for any station of the selected modes within a generous straight-line reach (5.5 km/h walking or 20 km/h biking for the leg's max time, plus 300 m). If there's none, it skips that combination's Transitous queries and says so in a note. Otherwise they'd be spent on trips that can't exist, such as walking 15 minutes to the San Diego Zoo from the nearest trolley stop.
 
@@ -39,9 +40,22 @@ With several modes selected, each first/last pairing is planned separately, beca
 
 A drive, park, transit and rideshare option is also hidden when **parking near the destination and taking a rideshare** is at least 15 minutes faster without more driving or a longer rideshare: the transit would only add time. A note says how many were hidden.
 
+### Free parking
+
+With **Prioritize free parking** on (under More options, on by default, for "Drive & park"), the app looks up parking around each candidate station in OpenStreetMap and favours stations with a free public lot. It's how Nobel Drive (a free public lot about 80 m from the platform) beats UTC (paid customer garages) on the Blue Line.
+
+- Parking is looked up within 300 m of the platform. It's **free** for a public lot tagged `fee=no`, or a park-and-ride lot that isn't tagged as charging. It's **paid** if the nearest usable lot charges, **none** if only private or customer lots are mapped, and **unknown** otherwise.
+- When choosing stations and ranking options, paid parking and "none" count as 15 extra minutes, unknown as 5 and free as nothing. A station whose parking couldn't be looked up counts nothing.
+- The app looks at 4 more stations than "Stations to compare", then chooses again with parking counted. Stations with a free lot get a Transitous query of their own first, so faster stations can't crowd them out of the answer; the rest follow in a second query for comparison. This uses the query budget already set aside for the comparison.
+- The drive goes to the lot itself, when one is known. The park-near-the-destination comparison is ranked with its parking too.
+- Each drive-and-park option shows its parking ("Free parking", "Paid parking", …), and the details show the lot and its distance from the platform.
+- Parking for a station is kept in the cache for 30 days, so a station costs one lookup a month. A search waits at most 6 seconds for parking; after that it compares stations without it (the server still finishes and caches the lookup). If Overpass fails, the server leaves it alone for 5 minutes.
+- Only station positions are sent to Overpass, never your start or destination. The requests follow [its terms](https://overpass.private.coffee/#terms): POST requests, a User-Agent with the app's name and your contact (`MULTIMODALNAV_CONTACT`), and one query at a time across all users. Its [privacy policy](https://overpass.private.coffee/#privacy) is linked in the app footer.
+- Turn it off to skip the lookups entirely.
+
 **No-transit comparisons** appear under "For comparison": driving or rideshare the whole way, walking or biking the whole way, and, when both "Drive & park" and "Rideshare" are selected, **park near the destination and rideshare the rest**. That last one parks at a station lot near the destination (from the rideshare search) and doesn't count against the max-drive limit.
 
-**Free tier use per drive-first search** (default 6 stations): about 7 TomTom routes (11 to 15 with a rideshare last leg) and 2 to 4 Transitous queries: Transitous's park-and-ride pick, one query for all stations, and sometimes a comparison query or a minimum-stops retry. Station lists are cached for a week, and repeating a search within a few minutes is mostly answered from the cache (below). Each extra first/last pairing adds 1 to 4 Transitous queries for a car first leg, or 1 or 2 for walk or bike. The app shows an estimate under **Find routes** before you search. TomTom's free 20,000 routes a month works out to roughly 1,300 to 2,800 single-mode searches. Transitous asks to be contacted above about 720 plan queries a day, which is roughly 200 to 300 searches.
+**Free tier use per drive-first search** (default 6 stations): about 7 TomTom routes (11 to 15 with a rideshare last leg) and 2 to 4 Transitous queries: Transitous's park-and-ride pick, one query for all stations, and sometimes a comparison query or a minimum-stops retry. Station lists are cached for a week, and repeating a search within a few minutes is mostly answered from the cache (below). Each extra first/last pairing adds 1 to 4 Transitous queries for a car first leg, or 1 or 2 for walk or bike. The app shows an estimate under **Find routes** before you search. TomTom's free 20,000 routes a month works out to roughly 1,300 to 2,800 single-mode searches. Transitous asks to be contacted above about 720 plan queries a day, which is roughly 200 to 300 searches. With free parking prioritized, a search also makes up to 2 Overpass queries the first time it sees a station, and none after that for a month.
 
 ### Usage tracking and rate limits
 
@@ -59,6 +73,7 @@ The server also limits upstream calls across **all** connected clients, so sever
 | TomTom requests in flight, all clients (`TOMTOM_MAX_IN_FLIGHT`, queue) | 2 | The request waits its turn (up to 15 s), then gets HTTP 503 |
 | Transitous requests in flight, all clients (`TRANSITOUS_MAX_IN_FLIGHT`, queue) | 3 | Same as above |
 | TomTom / Transitous requests per second (`TOMTOM_MAX_PER_SECOND`, `TRANSITOUS_MAX_PER_SECOND`, fallback) | 4 / 4 | The request waits for the next free second (up to 8 s), then gets HTTP 503 |
+| Overpass (parking) requests, all clients (fixed) | 1 at a time (queue), 1 per second (fallback) | Same as above; parking then counts as unknown for that search |
 | Requests per minute from one device (`CLIENT_MAX_PER_MINUTE`, both) | 120 | HTTP 429 with a `Retry-After`, so one runaway client can't starve the others |
 
 - Station-list tiles skip these limits. They come in a burst at the start of a search and are mostly served from Cloudflare's cache.
@@ -79,6 +94,7 @@ With the `USAGE_DB` database, the server keeps successful answers in a `cache` t
 | TomTom drive, leaving later | 15 minutes | Predicted traffic changes slowly |
 | Transitous trip plan | 2 minutes | Real-time delays and cancellations |
 | Transitous place search | 1 day | Places rarely change |
+| Parking at a station (Overpass) | 30 days | Parking rarely changes; a failed lookup isn't kept |
 
 - A cached answer has to match the request exactly: same places, same time and same options. "Leave now" searches are pinned to the whole minute, so searching again soon after (say, with another leg mode turned on) reuses everything the two searches share. TomTom "leave now" lookups match for the full 5 minutes.
 - Each set of results says how many answers came from the cache, and every cached API response has an `X-Cache: HIT` header (`MISS` when it was fetched and stored).
@@ -94,7 +110,7 @@ Create a free account at [developer.tomtom.com](https://developer.tomtom.com) (n
 
 ```sh
 npm install
-cp .dev.vars.example .dev.vars   # set APP_PASSWORD, TRANSITOUS_CONTACT, and TOMTOM_API_KEY if you have it
+cp .dev.vars.example .dev.vars   # set APP_PASSWORD, MULTIMODALNAV_CONTACT, and TOMTOM_API_KEY if you have it
 npm run dev                      # Vite on :5173, Pages Functions on :8788
 ```
 
@@ -182,7 +198,7 @@ The site finds it automatically through Wrangler's local registry. Without it ru
 - Build command: `npm run build`
 - Build output directory: `dist`
 - Root directory: leave blank
-- Under Settings → Variables and Secrets, add `APP_PASSWORD`, `TOMTOM_API_KEY` and `TRANSITOUS_CONTACT` as **secrets**. Because the repo has a `wrangler.toml`, Cloudflare treats that file as the source of truth for plain-text variables and won't let you edit them in the dashboard. Secrets are still set in the dashboard, and they also keep your contact details out of the public repo.
+- Under Settings → Variables and Secrets, add `APP_PASSWORD`, `TOMTOM_API_KEY` and `MULTIMODALNAV_CONTACT` as **secrets**. Because the repo has a `wrangler.toml`, Cloudflare treats that file as the source of truth for plain-text variables and won't let you edit them in the dashboard. Secrets are still set in the dashboard, and they also keep your contact details out of the public repo.
 
 **Or from the CLI:**
 
@@ -190,7 +206,7 @@ The site finds it automatically through Wrangler's local registry. Without it ru
 npx wrangler pages project create multimodalnav
 npx wrangler pages secret put APP_PASSWORD --project-name multimodalnav
 npx wrangler pages secret put TOMTOM_API_KEY --project-name multimodalnav
-npx wrangler pages secret put TRANSITOUS_CONTACT --project-name multimodalnav
+npx wrangler pages secret put MULTIMODALNAV_CONTACT --project-name multimodalnav
 npm run deploy
 ```
 
@@ -200,7 +216,7 @@ npm run deploy
 | --- | --- | --- |
 | `APP_PASSWORD` | yes | Password for the app; also signs the session cookie |
 | `TOMTOM_API_KEY` | no | Traffic-aware drive and rideshare times; without it they're estimates |
-| `TRANSITOUS_CONTACT` | recommended | Your email or a URL, sent to Transitous in the User-Agent (`MultiModalNav/<version> (+<repo>; <contact>)`) as its usage policy asks |
+| `MULTIMODALNAV_CONTACT` | recommended | Your email or a URL, sent to Transitous and the Private.coffee Overpass API in the User-Agent (`MultiModalNav/<version> (+<repo>; <contact>)`), as their usage policies ask. Formerly `TRANSITOUS_CONTACT` |
 | `TOMTOM_MONTHLY_LIMIT` | no (in `wrangler.toml`) | TomTom routes per month before calls stop; default 20000 |
 | `TRANSITOUS_DAILY_LIMIT` | no (in `wrangler.toml`) | Transitous plan queries per day shown in the footer; default 720 |
 | `TOMTOM_MAX_PER_SECOND` | no (in `wrangler.toml`) | TomTom requests per second across all clients; default 4 |
@@ -219,7 +235,8 @@ Every `/api/*` route except login and logout requires a session cookie. The cook
 
 ## Usage terms and attribution
 
-- **Transitous** is a volunteer service for open-source, non-commercial apps. Its [usage policy](https://transitous.org/api/) asks for a visible link to [its data sources](https://transitous.org/sources/) (shown in the app footer), a User-Agent with contact details (set by the proxy from `TRANSITOUS_CONTACT`), and a heads-up for heavy use.
+- **Transitous** is a volunteer service for open-source, non-commercial apps. Its [usage policy](https://transitous.org/api/) asks for a visible link to [its data sources](https://transitous.org/sources/) (shown in the app footer), a User-Agent with contact details (set by the proxy from `MULTIMODALNAV_CONTACT`), and a heads-up for heavy use.
+- **Private.coffee Overpass** is free, with no hard rate limits. Its [terms](https://overpass.private.coffee/#terms) ask for POST requests, a meaningful User-Agent with a contact (from `MULTIMODALNAV_CONTACT`), few simultaneous requests, notice before going above 10 requests a second or 10 at once, OpenStreetMap credit, no personal data in queries, and a link to its privacy policy. The app queries one at a time, sends only station positions, caches answers for 30 days, and links the policy in the footer. It records the User-Agent (with your contact) for up to 48 hours.
 - **OpenStreetMap / OpenFreeMap** attribution is shown on the map.
 - Check TomTom's terms for your use when you sign up.
 
@@ -229,6 +246,7 @@ Every `/api/*` route except login and logout requires a session cookie. The cook
 - **Coverage depends on Transitous.** For example, NCTD in San Diego County (Coaster, Sprinter, Breeze) isn't in Transitous yet, so those lines can't be routed. LA Metro, Metrolink, San Diego MTS, OCTA and Amtrak are covered, most with live data.
 - **"Own bike" doesn't restrict to bike-friendly trains**, because many feeds don't publish that data and enabling the filter returns no results. Check the agency's bike rules.
 - **Bike/scooter share** needs share-system data in Transitous, which many areas lack.
-- **Parking** comes from OpenStreetMap park-and-ride lots when Transitous finds one; other stations assume you park at the station. Cost and availability aren't known.
+- **Parking** is only as good as OpenStreetMap's tags: many lots have no `fee` or `access` tag (shown as unknown), and street parking isn't counted. Prices and availability aren't known. Without "Prioritize free parking", parking comes from Transitous's park-and-ride pick when it finds one, and other stations assume you park at the station.
+- **Private.coffee's Overpass server can be unavailable.** In testing on 26 November 2026, its API didn't answer for over an hour. Searches then plan without parking data (with a note) and try again after 5 minutes.
 - **Rideshare** is modeled as your pickup wait plus a car trip in traffic. The app has no price, surge or availability data.
 - **Park-and-ride (`CAR_PARKING`) is marked experimental** in the MOTIS API, so it may change.

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { fmtDistance, fmtDuration, fmtTime } from '../lib/format';
+  import { fmtDistance, fmtDuration, fmtTime, parkingDetail } from '../lib/format';
   import { modeIcon } from '../lib/modes';
   import type { TripOption } from '../lib/types';
 
@@ -47,6 +47,9 @@
             <div class="traffic">Estimated time (no traffic data)</div>
           {:else if leg.trafficDelaySec !== undefined && leg.trafficDelaySec >= 60}
             <div class="traffic warn">Includes {fmtDuration(leg.trafficDelaySec)} of traffic delay</div>
+          {/if}
+          {#if leg.mode === 'PARK' && option.parking}
+            <div class="parking">🅿️ {parkingDetail(option.parking)} <span class="credit">(OpenStreetMap)</span></div>
           {/if}
           {#each leg.alerts ?? [] as alert}
             <div class="alert">⚠️ {alert}</div>
@@ -129,10 +132,14 @@
     font-size: 0.85rem;
   }
   .meta,
-  .traffic {
+  .traffic,
+  .parking {
     font-size: 0.85rem;
     color: var(--muted);
     margin-top: 0.15rem;
+  }
+  .credit {
+    font-size: 0.75rem;
   }
   .traffic.warn {
     color: #b45309;

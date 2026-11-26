@@ -3,6 +3,7 @@ import type {
   GeocodeMatch,
   LatLon,
   MotisPlace,
+  ParkingInfo,
   PlanOffset,
   PlanResponse,
   TomTomRouteResponse,
@@ -107,6 +108,15 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(offsets),
+      signal,
+    }),
+
+  /** Parking near each station, in order; null (and `incomplete`) where it couldn't be looked up. */
+  parking: (stations: LatLon[], signal?: AbortSignal) =>
+    fetched<{ parking: (ParkingInfo | null)[]; incomplete?: boolean }>('/api/parking', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stations: stations.map(({ lat, lon }) => ({ lat, lon })) }),
       signal,
     }),
 

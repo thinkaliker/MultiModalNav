@@ -29,8 +29,11 @@ import {
   startLater,
   endWithLeg,
   RIDESHARE_COST_FACTOR,
+  atLot,
+  parkingPenaltySec,
+  PARKING_PENALTY_SEC,
 } from '../src/lib/planner';
-import type { LegCombo, MotisItinerary, MotisLeg, MotisPlace, PlanResponse, TripOption, TripSettings } from '../src/lib/types';
+import type { LegCombo, MotisItinerary, MotisLeg, MotisPlace, ParkingInfo, PlanResponse, TripOption, TripSettings } from '../src/lib/types';
 
 const torrance = { lat: 33.8358, lon: -118.3406, name: 'Home' };
 const santaMonica = { lat: 34.0195, lon: -118.4912, name: 'Work' };
@@ -69,6 +72,7 @@ const request: LegCombo = {
   rideshareWaitMin: 6,
   stationsToCompare: 6,
   minTransitStops: 3,
+  prioritizeFreeParking: false,
 };
 
 describe('scoreStation', () => {
@@ -353,6 +357,7 @@ describe('estimateCost', () => {
     rideshareWaitMin: 6,
     stationsToCompare: 6,
     minTransitStops: 3,
+    prioritizeFreeParking: true,
   };
 
   it('matches a plain park-and-ride search', () => {
@@ -679,5 +684,59 @@ describe('rideshare cost and weighted offsets', () => {
     expect(real.legs[0].duration).toBe(15 * 60);
     expect(real.legs[2].duration).toBe(12 * 60);
     expect(it.endTime).toBe(at(50)); // the original is untouched
+  });
+});
+
+describe('prioritizing free parking', () => {
+  // Highlands Village Place to the Air & Space Museum, with Blue Line stations near UTC.
+  const home = { lat: 32.9496, lon: -117.2304, name: 'Home' };
+  const museum = { lat: 32.7262, lon: -117.1543, name: 'Museum' };
+  const tram = (name: string, lat: number, lon: number): MotisPlace => ({ name, stopId: name, lat, lon, modes: ['TRAM'] });
+  const stations = [tram('UTC', 32.8692, -117.214), tram('Executive Drive', 32.8741, -117.214), tram('Nobel Drive', 32.8669, -117.2304)];
+  const free: ParkingInfo = { status: 'free', lot: { lat: 32.8676, lon: -117.2307, distanceM: 80, fee: 'no', access: 'yes', parkRide: false } };
+  const paid: ParkingInfo = { status: 'paid', lot: { lat: 32.8701, lon: -117.2151, distanceM: 143, fee: 'yes', parkRide: false } };
+  const parking = new Map([
+    ['UTC', paid],
+    ['Executive Drive', { status: 'unknown' } as ParkingInfo],
+    ['Nobel Drive', free],
+  ]);
+
+  it('prefers the station with a free lot over a slightly better-placed one with paid parking', () => {
+    const pair = [stations[0], stations[2]];
+    expect(pickCandidates(pair, [], home, museum, 33, 1).map((c) => c.name)).toEqual(['UTC']);
+    const picked = pickCandidates(pair, [], home, museum, 33, 1, 0, (c) => parkingPenaltySec(parking.get(c.key)));
+    expect(picked.map((c) => c.name)).toEqual(['Nobel Drive']);
+  });
+
+  it('counts nothing against a station whose parking is unavailable', () => {
+    expect(parkingPenaltySec(undefined)).toBe(0);
+    expect(parkingPenaltySec(free)).toBe(0);
+    expect(parkingPenaltySec({ status: 'unknown' })).toBe(PARKING_PENALTY_SEC.unknown);
+    expect(PARKING_PENALTY_SEC.paid).toBeGreaterThan(PARKING_PENALTY_SEC.unknown);
+  });
+
+  it('drives to the lot itself when it is known', () => {
+    const [nobel] = pickCandidates([stations[2]], [], home, museum, 33, 1);
+    expect(atLot(nobel, free).park).toEqual({ lat: 32.8676, lon: -117.2307 });
+    expect(atLot(nobel, { status: 'none' }).park).toEqual(nobel.station);
+  });
+
+  it('ranks options with their parking penalty', () => {
+    const option = (end: string, penaltySec?: number) =>
+      ({ startTime: '2026-12-01T16:00:00Z', endTime: `2026-12-01T${end}:00Z`, transfers: 0, legs: [], penaltySec }) as unknown as TripOption;
+    // Ten minutes faster, but paying to park: the free lot wins.
+    expect(optionCost(false, option('17:00', PARKING_PENALTY_SEC.paid))).toBeGreaterThan(optionCost(false, option('17:10', 0)));
+  });
+
+  it("doesn't hide transit from a free lot for a park & rideshare that pays to park", () => {
+    const option = (durationMin: number, rideMin: number, penaltySec = 0) =>
+      ({
+        durationSec: durationMin * 60,
+        penaltySec,
+        traffic: { label: 'Drive', driveSec: 21 * 60, delaySec: 0, estimated: false },
+        legs: [{ mode: 'TRAM', durationSec: 600 }, { mode: 'RIDESHARE', durationSec: rideMin * 60 }],
+      }) as unknown as TripOption;
+    expect(slowerThanParkAndRideshare(option(58, 11), option(40, 11))).toBe(true);
+    expect(slowerThanParkAndRideshare(option(58, 11), option(40, 11, PARKING_PENALTY_SEC.paid))).toBe(false);
   });
 });
