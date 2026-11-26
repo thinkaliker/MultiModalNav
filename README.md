@@ -57,10 +57,10 @@ With **Prioritize free parking** on (under More options, on by default, for "Dri
   | [Private.coffee](https://overpass.private.coffee/) | Whole planet | Free, no rate limit. The only one that gets your contact (`MULTIMODALNAV_CONTACT`) |
   | [dresel.systems](https://ovp.dresel.systems/) | North America and Europe (the app only uses it for the US, Canada and western/central Europe) | Free, no key, data refreshed nightly, up to 4 queries at once per IP |
   | [NextGIS](https://docs.nextgis.com/docs_ngcom/source/services.html#overpass) | Whole planet | Free account key (`NEXTGIS_OVERPASS_KEY`); no stated limits, though its terms let it set some. Skipped without a key |
-  | [FairwayMapper](https://www.fairwaymapper.com/api-access) | Whole planet | Account key (`FAIRWAYMAPPER_OVERPASS_KEY`); free tier for active OpenStreetMap contributors. Skipped without a key |
+  | [FairwayMapper](https://www.fairwaymapper.com/api-access) | Whole planet | Account key (`FAIRWAYMAPPER_OVERPASS_KEY`); free tier for active OpenStreetMap contributors, 2,000 queries a month. The app stops at 1,800 a month (`FAIRWAYMAPPER_MONTHLY_LIMIT`), leaving room for queries its count misses. Skipped without a key |
   | [overpass-api.de](https://overpass-api.de/) (FOSSGIS) | Whole planet | Often overloaded and asks apps to prefer alternatives, so it's last, and capped at 50 queries a day (`OVERPASS_DE_DAILY_LIMIT`) to stay under its guideline of 100 |
 
-- Each server gets POST requests, one at a time across all users (its own queue), and gives up after 6 seconds. Servers other than Private.coffee get a User-Agent with the app's name and repo link, which is what their policies ask for. The keyed servers identify you by key instead.
+- Each server gets POST requests, one at a time across all users (its own queue), and gives up after 6 seconds. A "too many requests" answer isn't retried (it would only spend quota); the next server is tried instead. Servers other than Private.coffee get a User-Agent with the app's name and repo link, which is what their policies ask for. The keyed servers identify you by key instead.
 - The keys go in the request path, so they're secrets: set them like `APP_PASSWORD` (below), never in `wrangler.toml`. The server never logs those URLs; a rejected key shows up in the Functions logs as `Overpass nextgis: key rejected (HTTP 401)`. Either setting also accepts the full interpreter URL that the provider's account page shows.
 - A server that fails or times out is skipped for 5 minutes, doubling each time it fails again, up to an hour. A success resets it. The `X-Overpass-Mirror` response header says which server answered.
 - Private.coffee's [privacy policy](https://overpass.private.coffee/#privacy) is linked in the app footer, as its terms ask.
@@ -88,6 +88,7 @@ The server also limits upstream calls across **all** connected clients, so sever
 | TomTom / Transitous requests per second (`TOMTOM_MAX_PER_SECOND`, `TRANSITOUS_MAX_PER_SECOND`, fallback) | 4 / 4 | The request waits for the next free second (up to 8 s), then gets HTTP 503 |
 | Overpass (parking) requests, all clients, per server (fixed) | 1 at a time (queue, waits up to 3 s), 1 per second (fallback) | The next server is tried; if none answers, parking counts as unknown for that search |
 | overpass-api.de queries per day (`OVERPASS_DE_DAILY_LIMIT`) | 50 | That server is skipped until the next UTC day |
+| FairwayMapper queries per month (`FAIRWAYMAPPER_MONTHLY_LIMIT`) | 1,800 | That server is skipped until the next UTC month |
 | Requests per minute from one device (`CLIENT_MAX_PER_MINUTE`, both) | 120 | HTTP 429 with a `Retry-After`, so one runaway client can't starve the others |
 
 - Station-list tiles skip these limits. They come in a burst at the start of a search and are mostly served from Cloudflare's cache.
@@ -243,6 +244,7 @@ npm run deploy
 | `TRANSITOUS_MAX_IN_FLIGHT` | no (in `wrangler.toml`) | Transitous requests running at once, all clients, with the queue; default 3 |
 | `CLIENT_MAX_PER_MINUTE` | no (in `wrangler.toml`) | Upstream requests per minute from one device; default 120 |
 | `OVERPASS_DE_DAILY_LIMIT` | no (in `wrangler.toml`) | Parking queries a day to overpass-api.de, all clients; default 50 |
+| `FAIRWAYMAPPER_MONTHLY_LIMIT` | no (in `wrangler.toml`) | Parking queries a month to FairwayMapper, all clients; default 1800 (its plan allows 2,000) |
 | `USAGE_DB` | recommended (D1 binding) | Turns on usage tracking, the TomTom monthly stop, the fallback limiter and the response cache |
 | `GATE` | recommended (Durable Object binding) | The request queue from `gate/`; see step 4 |
 
@@ -256,7 +258,7 @@ Every `/api/*` route except login and logout requires a session cookie. The cook
 
 - **Transitous** is a volunteer service for open-source, non-commercial apps. Its [usage policy](https://transitous.org/api/) asks for a visible link to [its data sources](https://transitous.org/sources/) (shown in the app footer), a User-Agent with contact details (set by the proxy from `MULTIMODALNAV_CONTACT`), and a heads-up for heavy use.
 - **Private.coffee Overpass** is free, with no hard rate limits. Its [terms](https://overpass.private.coffee/#terms) ask for POST requests, a meaningful User-Agent with a contact (from `MULTIMODALNAV_CONTACT`), few simultaneous requests, notice before going above 10 requests a second or 10 at once, OpenStreetMap credit, no personal data in queries, and a link to its privacy policy. The app queries one at a time, sends only station positions, caches answers for 30 days, and links the policy in the footer. It records the User-Agent (with your contact) for up to 48 hours.
-- **The other Overpass servers** ([list above](#free-parking)) are free. dresel.systems asks for an identifying User-Agent and at most 4 parallel queries. NextGIS and FairwayMapper need an account key; NextGIS states no limits but its terms let it set them, and FairwayMapper's free tier is for active OpenStreetMap contributors. overpass-api.de asks for an identifying User-Agent, no parallel queries, under 100 queries a day for regular use across all of an app's users, and a 30-second pause after a 429; the app caps it at 50 a day and pauses for 5 minutes or more after any failure.
+- **The other Overpass servers** ([list above](#free-parking)) are free. dresel.systems asks for an identifying User-Agent and at most 4 parallel queries. NextGIS and FairwayMapper need an account key; NextGIS states no limits but its terms let it set them, and FairwayMapper's free tier is for active OpenStreetMap contributors, at 2,000 queries a month. overpass-api.de asks for an identifying User-Agent, no parallel queries, under 100 queries a day for regular use across all of an app's users, and a 30-second pause after a 429; the app caps it at 50 a day and pauses for 5 minutes or more after any failure.
 - **OpenStreetMap / OpenFreeMap** attribution is shown on the map.
 - Check TomTom's terms for your use when you sign up.
 

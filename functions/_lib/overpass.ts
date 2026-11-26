@@ -21,8 +21,8 @@ export interface Mirror {
   endpoint(points: Point[], keys: OverpassKeys): string | null;
   /** Whether it gets MULTIMODALNAV_CONTACT in the User-Agent; the others get the app name and repo. */
   contact: boolean;
-  /** A daily cap across all users, for servers whose usage policy sets one. */
-  dailyMetric?: Metric;
+  /** A cap across all users (per day or month, see usage.ts), for servers with a quota. */
+  quota?: Metric;
 }
 
 type Box = [south: number, west: number, north: number, east: number];
@@ -65,15 +65,16 @@ export const MIRRORS: Mirror[] = [
     endpoint: (_, keys) => keyed((key) => `https://overpass.nextgis.com/${key}/api/interpreter`, keys.NEXTGIS_OVERPASS_KEY),
     contact: false,
   },
-  // Free tier for OpenStreetMap contributors, with an account key.
+  // Free tier for OpenStreetMap contributors, with an account key: 2,000 queries a month.
   {
     id: 'fairwaymapper',
     endpoint: (_, keys) =>
       keyed((key) => `https://api.fairwaymapper.com/k/${key}/api/interpreter`, keys.FAIRWAYMAPPER_OVERPASS_KEY),
     contact: false,
+    quota: 'fairwaymapper',
   },
   // The main server is often overloaded and asks apps to use alternatives, so it's last and capped.
-  { id: 'overpass-api.de', endpoint: fixed('https://overpass-api.de/api/interpreter'), contact: false, dailyMetric: 'overpass-api.de' },
+  { id: 'overpass-api.de', endpoint: fixed('https://overpass-api.de/api/interpreter'), contact: false, quota: 'overpass-api.de' },
 ];
 
 /** A server's recent failures; stored per server in the D1 cache table. */

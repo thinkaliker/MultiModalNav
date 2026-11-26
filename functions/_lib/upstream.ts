@@ -1,5 +1,14 @@
 import { guardUpstream, type RateEnv } from './ratelimit';
-import { fetchWithRetry, GATE_HEADER, isOverpass, REJECTED_HEADER, type CacheOptions, type GateJob, type Service } from './upstream-common';
+import {
+  fetchWithRetry,
+  GATE_HEADER,
+  isOverpass,
+  REJECTED_HEADER,
+  retriesFor,
+  type CacheOptions,
+  type GateJob,
+  type Service,
+} from './upstream-common';
 
 /** The parts of the GATE Durable Object binding used here. */
 export interface GateBinding {
@@ -93,5 +102,5 @@ export async function callUpstream(
 
   const limited = await guardUpstream(env, request, call.service, waitUntil);
   if (limited) return { response: limited, rejected: true, via: 'limiter' };
-  return { response: await fetchWithRetry(call.url, init), rejected: false, via: 'limiter' };
+  return { response: await fetchWithRetry(call.url, init, undefined, retriesFor(call.service)), rejected: false, via: 'limiter' };
 }

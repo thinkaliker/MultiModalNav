@@ -1,13 +1,13 @@
 // Usage counters for the upstream services with free-tier limits, kept in D1 (optional:
 // without a USAGE_DB binding nothing is counted and nothing is limited).
 
-export type Metric = 'tomtom.route' | 'transitous.plan' | 'overpass-api.de';
+export type Metric = 'tomtom.route' | 'transitous.plan' | 'overpass-api.de' | 'fairwaymapper';
 
 interface MetricInfo {
   /** TomTom's free tier is monthly; Transitous asks for a heads-up above ~720 plan queries a day. */
   window: 'month' | 'day';
   defaultLimit: number;
-  limitVar: 'TOMTOM_MONTHLY_LIMIT' | 'TRANSITOUS_DAILY_LIMIT' | 'OVERPASS_DE_DAILY_LIMIT';
+  limitVar: 'TOMTOM_MONTHLY_LIMIT' | 'TRANSITOUS_DAILY_LIMIT' | 'OVERPASS_DE_DAILY_LIMIT' | 'FAIRWAYMAPPER_MONTHLY_LIMIT';
 }
 
 export const METRICS: Record<Metric, MetricInfo> = {
@@ -15,6 +15,8 @@ export const METRICS: Record<Metric, MetricInfo> = {
   'transitous.plan': { window: 'day', defaultLimit: 720, limitVar: 'TRANSITOUS_DAILY_LIMIT' },
   // The main Overpass server's guideline for regular use is under 100 queries a day, all users together.
   'overpass-api.de': { window: 'day', defaultLimit: 50, limitVar: 'OVERPASS_DE_DAILY_LIMIT' },
+  // FairwayMapper's plan allows 2,000 queries a month; this leaves room for ones the count misses.
+  fairwaymapper: { window: 'month', defaultLimit: 1800, limitVar: 'FAIRWAYMAPPER_MONTHLY_LIMIT' },
 };
 
 /** The parts of a D1 database used here; structural so tests can use plain SQLite. */
@@ -34,6 +36,7 @@ export interface UsageEnv {
   TOMTOM_MONTHLY_LIMIT?: string;
   TRANSITOUS_DAILY_LIMIT?: string;
   OVERPASS_DE_DAILY_LIMIT?: string;
+  FAIRWAYMAPPER_MONTHLY_LIMIT?: string;
 }
 
 export interface Meter {

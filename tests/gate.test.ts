@@ -120,4 +120,14 @@ describe('fetchWithRetry', () => {
     const res = await fetchWithRetry('https://upstream.test', {}, async () => new Response('{}', { status: statuses.shift() }));
     expect(res.status).toBe(200);
   });
+
+  it("doesn't retry Overpass servers, which count every query", async () => {
+    let calls = 0;
+    const gate = new GateCore(async () => {
+      calls++;
+      return new Response('{}', { status: 429 });
+    });
+    expect((await gate.handle(job({ service: 'overpass:fairwaymapper' }))).status).toBe(429);
+    expect(calls).toBe(1);
+  });
 });

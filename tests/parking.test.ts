@@ -191,6 +191,16 @@ describe('POST /api/parking', () => {
     warn.mockRestore();
   });
 
+  it('stops using a server once its monthly quota is used up', async () => {
+    const fetcher = servers({ 'fairwaymapper.com': [...nobelLots, ...utcLots] });
+    vi.stubGlobal('fetch', fetcher);
+    const env = { USAGE_DB: sqliteDb(), FAIRWAYMAPPER_OVERPASS_KEY: 'k', FAIRWAYMAPPER_MONTHLY_LIMIT: '1' } as Env;
+
+    expect((await call(env, [nobelDrive])).res.headers.get(MIRROR_HEADER)).toBe('fairwaymapper');
+    expect((await call(env, [utc])).body.incomplete).toBe(true);
+    expect(hosts(fetcher).filter((h) => h === 'api.fairwaymapper.com')).toHaveLength(1);
+  });
+
   it('does not cache a query a server cut short', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({ elements: [], remark: 'runtime error: Query timed out' })));
     expect((await call({ USAGE_DB: sqliteDb() } as Env, [utc])).body.incomplete).toBe(true);

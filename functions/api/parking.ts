@@ -82,8 +82,8 @@ async function ask(
   points: Point[],
   waitUntil: (p: Promise<unknown>) => void,
 ): Promise<OverpassElement[] | 'failed' | 'skipped'> {
-  if (mirror.dailyMetric && env.USAGE_DB) {
-    const allowed = await recordUse(env.USAGE_DB, mirror.dailyMetric, limitFor(env, mirror.dailyMetric)).catch(() => true);
+  if (mirror.quota && env.USAGE_DB) {
+    const allowed = await recordUse(env.USAGE_DB, mirror.quota, limitFor(env, mirror.quota)).catch(() => true);
     if (!allowed) return 'skipped';
   }
   try {
@@ -107,7 +107,7 @@ async function ask(
     );
     if (rejected) {
       await response.body?.cancel();
-      if (mirror.dailyMetric && env.USAGE_DB) await undoUse(env.USAGE_DB, mirror.dailyMetric).catch(() => {});
+      if (mirror.quota && env.USAGE_DB) await undoUse(env.USAGE_DB, mirror.quota).catch(() => {});
       return 'skipped';
     }
     if (!response.ok) {

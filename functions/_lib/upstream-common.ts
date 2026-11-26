@@ -63,10 +63,21 @@ export function rejected(status: 429 | 503, error: string, retryAfterSec: number
 
 const MAX_RETRIES = 2;
 
+/**
+ * Retries for a service's "too many requests": none for Overpass servers, which count every query
+ * against a quota or ask for a longer pause (the app moves on to the next server instead).
+ */
+export const retriesFor = (service: Service) => (isOverpass(service) ? 0 : MAX_RETRIES);
+
 /** Fetch, backing off and retrying when upstream answers "too many requests". */
-export async function fetchWithRetry(url: string, init: UpstreamInit, fetcher: Fetcher = platformFetch): Promise<Response> {
+export async function fetchWithRetry(
+  url: string,
+  init: UpstreamInit,
+  fetcher: Fetcher = platformFetch,
+  retries = MAX_RETRIES,
+): Promise<Response> {
   let res = await fetcher(url, init);
-  for (let attempt = 1; res.status === 429 && attempt <= MAX_RETRIES; attempt++) {
+  for (let attempt = 1; res.status === 429 && attempt <= retries; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
     res = await fetcher(url, init);
   }
@@ -116,6 +127,7 @@ export class GateCore {
         job.url,
         { method: job.method, headers: job.headers, body: job.body, cf: job.cf, timeoutMs: job.timeoutMs },
         this.fetcher,
+        retriesFor(job.service),
       );
       // The slot is freed once headers arrive; the body streams on without holding it.
       return new Response(res.body, {
