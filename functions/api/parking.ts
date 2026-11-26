@@ -1,7 +1,7 @@
 import { CACHE_HEADER, cacheKey, readCache, writeCache } from '../_lib/cache';
 import { json } from '../_lib/http';
 import { classifyParking, overpassQuery, type OverpassElement, type ParkingInfo, type Point } from '../_lib/parking';
-import { failed, MIRRORS, type Health, type Mirror } from '../_lib/overpass';
+import { failed, MIRRORS, type Health, type Mirror, type OverpassKeys } from '../_lib/overpass';
 import { callUpstream, type UpstreamEnv } from '../_lib/upstream';
 import { limitFor, recordUse, undoUse } from '../_lib/usage';
 import { userAgent } from '../_lib/useragent';
@@ -39,7 +39,7 @@ export function parseStations(body: unknown): Point[] | null {
 }
 
 // Narrower than Env, so the tests can type-check this without the Workers types.
-export interface ParkingEnv extends UpstreamEnv {
+export interface ParkingEnv extends UpstreamEnv, OverpassKeys {
   MULTIMODALNAV_CONTACT?: string;
 }
 
@@ -112,6 +112,8 @@ async function ask(
     }
     if (!response.ok) {
       await response.body?.cancel();
+      // Never log the URL: keyed servers have the key in it.
+      if (response.status === 401 || response.status === 403) console.warn(`Overpass ${mirror.id}: key rejected (HTTP ${response.status})`);
       return 'failed';
     }
     const body = (await response.json()) as { elements?: OverpassElement[]; remark?: string };
@@ -131,7 +133,7 @@ async function lookup(env: ParkingEnv, request: Request, points: Point[], waitUn
   const started = Date.now();
   for (const mirror of MIRRORS) {
     if (Date.now() - started > LOOKUP_BUDGET_MS) break;
-    const url = mirror.endpoint(points);
+    const url = mirror.endpoint(points, env);
     if (!url) continue;
     const health = parsed<Health>(await cached(env, healthKey(mirror)));
     if (health && health.until > Date.now()) continue;

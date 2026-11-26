@@ -7,6 +7,7 @@ compatibility_date = "2025-09-01"
 #   TOMTOM_API_KEY   TomTom Routing API key (traffic-aware drive times)
 #   MULTIMODALNAV_CONTACT  your email or URL, sent to Transitous and the Private.coffee
 #                          Overpass API in the User-Agent
+#   NEXTGIS_OVERPASS_KEY, FAIRWAYMAPPER_OVERPASS_KEY  optional Overpass API keys (parking data)
 # For local dev, copy .dev.vars.example to .dev.vars.
 
 # Free-tier limits shown in the usage footer. TomTom calls stop at the monthly limit

@@ -9,7 +9,7 @@ A park-and-ride and multimodal trip planner, built as an installable web app (PW
 | Map | [OpenFreeMap](https://openfreemap.org) + MapLibre GL | No key needed |
 | Transit, walk and bike routing, stations, place search | [Transitous](https://transitous.org) (MOTIS 2 API) | No key; worldwide community GTFS/GTFS-RT feeds |
 | Driving with traffic | [TomTom Routing API](https://developer.tomtom.com) | Free tier, key kept server-side |
-| Parking at stations | OpenStreetMap via public Overpass API servers ([Private.coffee](https://overpass.private.coffee/) first) | No key; only with "Prioritize free parking" |
+| Parking at stations | OpenStreetMap via Overpass API servers ([Private.coffee](https://overpass.private.coffee/) first) | Optional keys for NextGIS and FairwayMapper; only with "Prioritize free parking" |
 | Hosting, API proxy, password | Cloudflare Pages + Functions | |
 
 A drive-first search:
@@ -50,16 +50,18 @@ With **Prioritize free parking** on (under More options, on by default, for "Dri
 - The drive goes to the lot itself, when one is known. The park-near-the-destination comparison is ranked with its parking too.
 - Each drive-and-park option shows its parking ("Free parking", "Paid parking", …), and the details show the lot and its distance from the platform.
 - Parking for a station is kept in the cache for 30 days, so a station costs one lookup a month. A search waits at most 10 seconds for parking; after that it compares stations without it (the server still finishes and caches the lookup).
-- Only station positions are sent, never your start or destination. The lookup goes to the first of these public Overpass servers that answers:
+- Only station positions are sent, never your start or destination. The lookup goes to the first of these Overpass servers that answers:
 
   | Server | Covers | Notes |
   | --- | --- | --- |
   | [Private.coffee](https://overpass.private.coffee/) | Whole planet | Free, no rate limit. The only one that gets your contact (`MULTIMODALNAV_CONTACT`) |
   | [dresel.systems](https://ovp.dresel.systems/) | North America and Europe (the app only uses it for the US, Canada and western/central Europe) | Free, no key, data refreshed nightly, up to 4 queries at once per IP |
-  | [VK Maps](https://maps.mail.ru/osm/tools/overpass/) (maps.mail.ru, run by VK in Russia) | Whole planet | Free, "no requests limitations" |
+  | [NextGIS](https://docs.nextgis.com/docs_ngcom/source/services.html#overpass) | Whole planet | Free account key (`NEXTGIS_OVERPASS_KEY`); no stated limits, though its terms let it set some. Skipped without a key |
+  | [FairwayMapper](https://www.fairwaymapper.com/api-access) | Whole planet | Account key (`FAIRWAYMAPPER_OVERPASS_KEY`); free tier for active OpenStreetMap contributors. Skipped without a key |
   | [overpass-api.de](https://overpass-api.de/) (FOSSGIS) | Whole planet | Often overloaded and asks apps to prefer alternatives, so it's last, and capped at 50 queries a day (`OVERPASS_DE_DAILY_LIMIT`) to stay under its guideline of 100 |
 
-- Each server gets POST requests, one at a time across all users (its own queue), and gives up after 6 seconds. Servers other than Private.coffee get a User-Agent with the app's name and repo link, which is what their policies ask for.
+- Each server gets POST requests, one at a time across all users (its own queue), and gives up after 6 seconds. Servers other than Private.coffee get a User-Agent with the app's name and repo link, which is what their policies ask for. The keyed servers identify you by key instead.
+- The keys go in the request path, so they're secrets: set them like `APP_PASSWORD` (below), never in `wrangler.toml`. The server never logs those URLs; a rejected key shows up in the Functions logs as `Overpass nextgis: key rejected (HTTP 401)`. Either setting also accepts the full interpreter URL that the provider's account page shows.
 - A server that fails or times out is skipped for 5 minutes, doubling each time it fails again, up to an hour. A success resets it. The `X-Overpass-Mirror` response header says which server answered.
 - Private.coffee's [privacy policy](https://overpass.private.coffee/#privacy) is linked in the app footer, as its terms ask.
 - Turn it off to skip the lookups entirely.
@@ -210,7 +212,7 @@ The site finds it automatically through Wrangler's local registry. Without it ru
 - Build command: `npm run build`
 - Build output directory: `dist`
 - Root directory: leave blank
-- Under Settings → Variables and Secrets, add `APP_PASSWORD`, `TOMTOM_API_KEY` and `MULTIMODALNAV_CONTACT` as **secrets**. Because the repo has a `wrangler.toml`, Cloudflare treats that file as the source of truth for plain-text variables and won't let you edit them in the dashboard. Secrets are still set in the dashboard, and they also keep your contact details out of the public repo.
+- Under Settings → Variables and Secrets, add `APP_PASSWORD`, `TOMTOM_API_KEY` and `MULTIMODALNAV_CONTACT` (plus `NEXTGIS_OVERPASS_KEY` and `FAIRWAYMAPPER_OVERPASS_KEY` if you have them) as **secrets**. Because the repo has a `wrangler.toml`, Cloudflare treats that file as the source of truth for plain-text variables and won't let you edit them in the dashboard. Secrets are still set in the dashboard, and they also keep your contact details out of the public repo.
 
 **Or from the CLI:**
 
@@ -219,6 +221,8 @@ npx wrangler pages project create multimodalnav
 npx wrangler pages secret put APP_PASSWORD --project-name multimodalnav
 npx wrangler pages secret put TOMTOM_API_KEY --project-name multimodalnav
 npx wrangler pages secret put MULTIMODALNAV_CONTACT --project-name multimodalnav
+npx wrangler pages secret put NEXTGIS_OVERPASS_KEY --project-name multimodalnav        # optional
+npx wrangler pages secret put FAIRWAYMAPPER_OVERPASS_KEY --project-name multimodalnav  # optional
 npm run deploy
 ```
 
@@ -229,6 +233,8 @@ npm run deploy
 | `APP_PASSWORD` | yes | Password for the app; also signs the session cookie |
 | `TOMTOM_API_KEY` | no | Traffic-aware drive and rideshare times; without it they're estimates |
 | `MULTIMODALNAV_CONTACT` | recommended | Your email or a URL, sent to Transitous and the Private.coffee Overpass API (not the other Overpass servers) in the User-Agent (`MultiModalNav/<version> (+<repo>; <contact>)`), as their usage policies ask. Formerly `TRANSITOUS_CONTACT` |
+| `NEXTGIS_OVERPASS_KEY` | no | NextGIS Overpass API key (or its full interpreter URL), a fallback server for parking data |
+| `FAIRWAYMAPPER_OVERPASS_KEY` | no | FairwayMapper Overpass API key (or its full interpreter URL), a fallback server for parking data |
 | `TOMTOM_MONTHLY_LIMIT` | no (in `wrangler.toml`) | TomTom routes per month before calls stop; default 20000 |
 | `TRANSITOUS_DAILY_LIMIT` | no (in `wrangler.toml`) | Transitous plan queries per day shown in the footer; default 720 |
 | `TOMTOM_MAX_PER_SECOND` | no (in `wrangler.toml`) | TomTom requests per second across all clients; default 4 |
@@ -240,7 +246,7 @@ npm run deploy
 | `USAGE_DB` | recommended (D1 binding) | Turns on usage tracking, the TomTom monthly stop, the fallback limiter and the response cache |
 | `GATE` | recommended (Durable Object binding) | The request queue from `gate/`; see step 4 |
 
-The first three are **secrets**: set them in the dashboard or with `wrangler pages secret put`, and never put them in `wrangler.toml`, which is public.
+The first five are **secrets**: set them in the dashboard or with `wrangler pages secret put`, and never put them in `wrangler.toml`, which is public.
 
 ## Password protection
 
@@ -250,7 +256,7 @@ Every `/api/*` route except login and logout requires a session cookie. The cook
 
 - **Transitous** is a volunteer service for open-source, non-commercial apps. Its [usage policy](https://transitous.org/api/) asks for a visible link to [its data sources](https://transitous.org/sources/) (shown in the app footer), a User-Agent with contact details (set by the proxy from `MULTIMODALNAV_CONTACT`), and a heads-up for heavy use.
 - **Private.coffee Overpass** is free, with no hard rate limits. Its [terms](https://overpass.private.coffee/#terms) ask for POST requests, a meaningful User-Agent with a contact (from `MULTIMODALNAV_CONTACT`), few simultaneous requests, notice before going above 10 requests a second or 10 at once, OpenStreetMap credit, no personal data in queries, and a link to its privacy policy. The app queries one at a time, sends only station positions, caches answers for 30 days, and links the policy in the footer. It records the User-Agent (with your contact) for up to 48 hours.
-- **The other Overpass servers** ([list above](#free-parking)) are free and keyless. dresel.systems asks for an identifying User-Agent and at most 4 parallel queries. VK Maps states no limits. overpass-api.de asks for an identifying User-Agent, no parallel queries, under 100 queries a day for regular use across all of an app's users, and a 30-second pause after a 429; the app caps it at 50 a day and pauses for 5 minutes or more after any failure.
+- **The other Overpass servers** ([list above](#free-parking)) are free. dresel.systems asks for an identifying User-Agent and at most 4 parallel queries. NextGIS and FairwayMapper need an account key; NextGIS states no limits but its terms let it set them, and FairwayMapper's free tier is for active OpenStreetMap contributors. overpass-api.de asks for an identifying User-Agent, no parallel queries, under 100 queries a day for regular use across all of an app's users, and a 30-second pause after a 429; the app caps it at 50 a day and pauses for 5 minutes or more after any failure.
 - **OpenStreetMap / OpenFreeMap** attribution is shown on the map.
 - Check TomTom's terms for your use when you sign up.
 
@@ -261,6 +267,6 @@ Every `/api/*` route except login and logout requires a session cookie. The cook
 - **"Own bike" doesn't restrict to bike-friendly trains**, because many feeds don't publish that data and enabling the filter returns no results. Check the agency's bike rules.
 - **Bike/scooter share** needs share-system data in Transitous, which many areas lack.
 - **Parking** is only as good as OpenStreetMap's tags: many lots have no `fee` or `access` tag (shown as unknown), and street parking isn't counted. Prices and availability aren't known. Without "Prioritize free parking", parking comes from Transitous's park-and-ride pick when it finds one, and other stations assume you park at the station.
-- **Public Overpass servers are often overloaded.** In testing on 26 November 2026, Private.coffee and overpass-api.de didn't answer for over an hour, while dresel.systems answered in 2 seconds and VK Maps in 10. The app moves on to the next server. If none answers in time, the search plans without parking data and says so.
+- **Public Overpass servers are often overloaded.** In testing on 26 November 2026, Private.coffee and overpass-api.de didn't answer for over an hour, while dresel.systems answered in 2 seconds. The app moves on to the next server. If none answers in time, the search plans without parking data and says so.
 - **Rideshare** is modeled as your pickup wait plus a car trip in traffic. The app has no price, surge or availability data.
 - **Park-and-ride (`CAR_PARKING`) is marked experimental** in the MOTIS API, so it may change.

@@ -75,9 +75,21 @@ describe('parseStations', () => {
 describe('Overpass servers', () => {
   it('uses the regional server only where it has data', () => {
     const dresel = MIRRORS.find((m) => m.id === 'dresel')!;
-    expect(dresel.endpoint([nobelDrive, utc])).toBe('https://ovp.dresel.systems/api-na/interpreter');
-    expect(dresel.endpoint([{ lat: 48.137, lon: 11.575 }])).toBe('https://ovp.dresel.systems/api/interpreter');
-    expect(dresel.endpoint([{ lat: 35.68, lon: 139.77 }])).toBeNull();
+    expect(dresel.endpoint([nobelDrive, utc], {})).toBe('https://ovp.dresel.systems/api-na/interpreter');
+    expect(dresel.endpoint([{ lat: 48.137, lon: 11.575 }], {})).toBe('https://ovp.dresel.systems/api/interpreter');
+    expect(dresel.endpoint([{ lat: 35.68, lon: 139.77 }], {})).toBeNull();
+  });
+
+  it('uses the keyed servers only with a key, given bare or as the full URL', () => {
+    const nextgis = MIRRORS.find((m) => m.id === 'nextgis')!;
+    const fairway = MIRRORS.find((m) => m.id === 'fairwaymapper')!;
+    expect(nextgis.endpoint([utc], {})).toBeNull();
+    expect(nextgis.endpoint([utc], { NEXTGIS_OVERPASS_KEY: ' abc-123 ' })).toBe('https://overpass.nextgis.com/abc-123/api/interpreter');
+    expect(fairway.endpoint([utc], { FAIRWAYMAPPER_OVERPASS_KEY: 'k_9' })).toBe('https://api.fairwaymapper.com/k/k_9/api/interpreter');
+    expect(nextgis.endpoint([utc], { NEXTGIS_OVERPASS_KEY: 'https://overpass.nextgis.com/xyz/api/interpreter' })).toBe(
+      'https://overpass.nextgis.com/xyz/api/interpreter',
+    );
+    expect(nextgis.endpoint([utc], { NEXTGIS_OVERPASS_KEY: '../oops' })).toBeNull();
   });
 
   it('sends the contact to Private.coffee only', () => {
@@ -159,9 +171,24 @@ describe('POST /api/parking', () => {
     const env = { USAGE_DB: sqliteDb() } as Env;
 
     expect((await call(env, [utc])).body).toEqual({ parking: [null], incomplete: true });
-    expect(hosts(fetcher)).toEqual(['overpass.private.coffee', 'ovp.dresel.systems', 'maps.mail.ru', 'overpass-api.de']);
+    expect(hosts(fetcher)).toEqual(['overpass.private.coffee', 'ovp.dresel.systems', 'overpass-api.de']);
     expect((await call(env, [nobelDrive])).body).toEqual({ parking: [null], incomplete: true });
-    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it('tries the keyed servers before overpass-api.de, without logging their keys', async () => {
+    const fetcher = servers({ 'nextgis.com': 401, 'fairwaymapper.com': [...nobelLots] });
+    vi.stubGlobal('fetch', fetcher);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const env = { USAGE_DB: sqliteDb(), NEXTGIS_OVERPASS_KEY: 'secret-n', FAIRWAYMAPPER_OVERPASS_KEY: 'secret-f' } as Env;
+
+    const { res, body } = await call(env, [nobelDrive]);
+    expect(body.parking).toEqual([expect.objectContaining({ status: 'free' })]);
+    expect(res.headers.get(MIRROR_HEADER)).toBe('fairwaymapper');
+    expect(hosts(fetcher)).toEqual(['overpass.private.coffee', 'ovp.dresel.systems', 'overpass.nextgis.com', 'api.fairwaymapper.com']);
+    expect(warn).toHaveBeenCalledWith('Overpass nextgis: key rejected (HTTP 401)');
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/secret-/);
+    warn.mockRestore();
   });
 
   it('does not cache a query a server cut short', async () => {

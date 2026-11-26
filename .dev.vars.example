@@ -3,3 +3,6 @@ TOMTOM_API_KEY=
 # Your email or a URL; Transitous and the Private.coffee Overpass API ask every client to
 # name a contact in its User-Agent.
 MULTIMODALNAV_CONTACT=
+# Optional Overpass API keys for parking data (the key, or the full interpreter URL).
+NEXTGIS_OVERPASS_KEY=
+FAIRWAYMAPPER_OVERPASS_KEY=
