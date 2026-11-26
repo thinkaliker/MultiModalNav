@@ -16,8 +16,15 @@ import {
   transitStops,
   canReachStation,
   reachKm,
+  exitPlace,
+  groupByBoarding,
+  tripCost,
+  TRANSFER_PENALTY_SEC,
+  earlyExits,
+  exitEarly,
+  dropDominated,
 } from '../src/lib/planner';
-import type { LegCombo, MotisItinerary, MotisLeg, MotisPlace, PlanResponse, TripSettings } from '../src/lib/types';
+import type { LegCombo, MotisItinerary, MotisLeg, MotisPlace, PlanResponse, TripOption, TripSettings } from '../src/lib/types';
 
 const torrance = { lat: 33.8358, lon: -118.3406, name: 'Home' };
 const santaMonica = { lat: 34.0195, lon: -118.4912, name: 'Work' };
@@ -343,18 +350,20 @@ describe('estimateCost', () => {
   };
 
   it('matches a plain park-and-ride search', () => {
-    // discovery + 6 stations; 6 station drives + drive the whole way
-    expect(estimateCost(base, true)).toEqual({ tomtom: 7, transitous: 7 });
-    expect(estimateCost(base, false)).toEqual({ tomtom: 0, transitous: 7 });
+    // discovery + one query for all stations + one for a comparison, and a retry for each;
+    // 6 station drives + drive the whole way
+    expect(estimateCost(base, true)).toEqual({ tomtom: 7, transitous: 5 });
+    expect(estimateCost(base, false)).toEqual({ tomtom: 0, transitous: 5 });
+    expect(estimateCost({ ...base, minTransitStops: 1 }, true)).toEqual({ tomtom: 7, transitous: 3 });
   });
 
   it('grows with each first/last combination', () => {
     const combos = { ...base, firstLegs: ['CAR_PARKING', 'BIKE'], lastLegs: ['WALK', 'RIDESHARE'] } satisfies TripSettings;
-    // Transitous: 1 discovery + 1 car mode x 2 last legs x 6 stations + 1 street mode x 2 last legs
-    // TomTom: 6 + 1, then 4 rideshare stations, then 4 park-and-rideshare drives
-    expect(estimateCost({ ...combos, minTransitStops: 1 }, true)).toEqual({ tomtom: 15, transitous: 15 });
-    // A minimum ride allows one retry per rideshare-last query: 6 stations + 1 bike query.
-    expect(estimateCost(combos, true)).toEqual({ tomtom: 15, transitous: 22 });
+    // Transitous: 1 discovery + 1 car mode x 2 last legs x 2 queries + 1 street mode x 2 last legs
+    // TomTom: 6 + 1, then 4 rideshare stations + 4 early-exit rides, then 4 park-and-rideshare drives
+    expect(estimateCost({ ...combos, minTransitStops: 1 }, true)).toEqual({ tomtom: 19, transitous: 7 });
+    // A minimum ride allows a retry per car query, plus the bike query with a rideshare last leg.
+    expect(estimateCost(combos, true)).toEqual({ tomtom: 19, transitous: 12 });
   });
 });
 
@@ -397,7 +406,92 @@ describe('minimum transit stops', () => {
     ];
     // Transitous reports the child stop; the offset was sent for its parent station.
     const its = [ride(1, stop('next', 32.61, { parentId: 'next-parent' })), ride(2, stop('other', 32.62))];
-    expect(offsetsAvoiding(its, offsets).map((o) => o.stopId)).toEqual(['far']);
+    expect(offsetsAvoiding(its.map(exitPlace), offsets).map((o) => o.stopId)).toEqual(['far']);
+  });
+});
+
+describe('merged station queries', () => {
+  const station = (key: string, lat: number) => ({
+    key,
+    stopId: key,
+    name: key,
+    station: { lat, lon: -117.15 },
+    park: { lat, lon: -117.15 },
+    walkSec: 0,
+    source: 'nearby' as const,
+    estimateSec: 0,
+  });
+  const trip = (board: MotisPlace): MotisItinerary => ({
+    duration: 600,
+    startTime: '2026-12-01T16:00:00Z',
+    endTime: '2026-12-01T16:10:00Z',
+    transfers: 0,
+    legs: [leg({ mode: 'CAR', from: place('START', torrance), to: board, startTime: '2026-12-01T16:00:00Z', endTime: '2026-12-01T16:10:00Z' })],
+  });
+
+  it('groups trips by the station they board at, matching child stops to parents', () => {
+    const stations = [station('north', 32.9), station('south', 32.7)];
+    const groups = groupByBoarding(
+      [
+        trip(place('North platform 1', { lat: 32.9001, lon: -117.15 }, { stopId: 'north-1', parentId: 'north' })),
+        trip(place('South', { lat: 32.7, lon: -117.15 }, { stopId: 'south' })),
+        trip(place('Unknown, near north', { lat: 32.901, lon: -117.15 }, { stopId: 'other' })),
+        trip(place('Far away', { lat: 33.5, lon: -117.15 }, { stopId: 'far' })),
+      ],
+      stations,
+    );
+    expect([...groups].map(([i, its]) => [stations[i].key, its.length])).toEqual([
+      ['north', 2],
+      ['south', 1],
+    ]);
+  });
+
+  it('ranks a transfer as worth five minutes', () => {
+    const arrive = (minute: number) => `2026-12-01T16:${String(minute).padStart(2, '0')}:00Z`;
+    // Two minutes faster with a transfer loses to the direct ride; ten minutes faster wins.
+    expect(tripCost(false, arrive(0), arrive(30), 1)).toBeGreaterThan(tripCost(false, arrive(0), arrive(32), 0));
+    expect(tripCost(false, arrive(0), arrive(30), 1)).toBeLessThan(tripCost(false, arrive(0), arrive(40), 0));
+    // Arrive-by prefers the later departure.
+    expect(tripCost(true, arrive(10), arrive(40), 0)).toBeLessThan(tripCost(true, arrive(5), arrive(40), 0));
+    expect(TRANSFER_PENALTY_SEC).toBe(300);
+  });
+});
+
+describe('leaving transit early', () => {
+  const t = (minute: number) => `2026-12-01T16:${String(minute).padStart(2, '0')}:00Z`;
+  const stop = (name: string, lat: number) => place(name, { lat, lon: -117.15 }, { stopId: name });
+  const stops = (n: number, lat: number) => Array.from({ length: n }, (_, i) => stop(`s${lat}-${i}`, lat + i * 0.001));
+  // Drive, Blue for 4 stops, walk across the platform, Green for 3 stops, then the injected rideshare.
+  const blueGreen: MotisItinerary = {
+    duration: 3600,
+    startTime: t(0),
+    endTime: '2026-12-01T17:00:00Z',
+    transfers: 1,
+    legs: [
+      leg({ mode: 'CAR', from: place('START', torrance), to: stop('balboa', 32.8), startTime: t(0), endTime: t(10) }),
+      leg({ mode: 'TRAM', routeShortName: 'Blue', from: stop('balboa', 32.8), to: stop('oldtown', 32.75), intermediateStops: stops(3, 32.78), startTime: t(12), endTime: t(22) }),
+      leg({ mode: 'WALK', from: stop('oldtown', 32.75), to: stop('oldtown', 32.75), startTime: t(22), endTime: t(24) }),
+      leg({ mode: 'TRAM', routeShortName: 'Green', from: stop('oldtown', 32.75), to: stop('riovista', 32.77), intermediateStops: stops(2, 32.76), startTime: t(30), endTime: t(40) }),
+      leg({ mode: 'CAR', from: stop('riovista', 32.77), to: place('END', santaMonica), startTime: t(40), endTime: '2026-12-01T17:00:00Z' }),
+    ],
+  };
+
+  it('offers an exit at each line change, with the stops ridden by then', () => {
+    expect(earlyExits(blueGreen)).toEqual([{ legIndex: 1, stops: 4 }]);
+  });
+
+  it('cuts the trip at the change and rides from there', () => {
+    const cut = exitEarly(blueGreen, 1, 15 * 60);
+    expect(cut.legs.map((l) => l.mode)).toEqual(['CAR', 'TRAM', 'CAR']);
+    expect(cut.legs[2].from.name).toBe('oldtown');
+    expect(Date.parse(cut.legs[2].startTime)).toBe(Date.parse(t(22)));
+    expect(Date.parse(cut.endTime)).toBe(Date.parse(t(37)));
+    expect(cut.transfers).toBe(0);
+    expect(cut.duration).toBe(37 * 60);
+    // Arriving 23 minutes sooner with one line fewer is clearly better.
+    expect(tripCost(false, cut.startTime, cut.endTime, cut.transfers)).toBeLessThan(
+      tripCost(false, blueGreen.startTime, blueGreen.endTime, blueGreen.transfers),
+    );
   });
 });
 
@@ -444,5 +538,29 @@ describe('canReachStation', () => {
     expect(canReachStation([cityCollege], zoo, 'BIKE', 10)).toBe(true);
     expect(canReachStation([], zoo, 'RIDESHARE', 15)).toBe(true);
     expect(reachKm('CAR_PARKING', 30)).toBeNull();
+  });
+});
+
+describe('dropDominated', () => {
+  const option = (id: string, start: string, end: string, transfers = 0) =>
+    ({ id, startTime: `2026-12-01T${start}:00Z`, endTime: `2026-12-01T${end}:00Z`, transfers }) as unknown as TripOption;
+
+  it('drops an option that leaves at about the same time and arrives clearly later', () => {
+    const kept = dropDominated(
+      [
+        option('best', '16:26', '17:12'),
+        option('worse', '16:27', '17:32', 1), // a minute later, 25 minutes behind with the transfer
+        option('later', '16:45', '17:45'), // leaves much later: a real alternative
+        option('close', '16:26', '17:24'), // 12 minutes behind: kept for the comparison
+      ],
+      false,
+    );
+    expect(kept.map((o) => o.id)).toEqual(['best', 'later', 'close']);
+  });
+
+  it('works from the arrival side for "arrive by"', () => {
+    const kept = dropDominated([option('late', '16:40', '17:20'), option('early', '16:20', '17:19')], true);
+    // Leaving 20 minutes earlier for the same arrival is clearly worse.
+    expect(kept.map((o) => o.id)).toEqual(['late']);
   });
 });
