@@ -25,6 +25,10 @@ import {
   dropDominated,
   revisitsStation,
   slowerThanParkAndRideshare,
+  optionCost,
+  startLater,
+  endWithLeg,
+  RIDESHARE_COST_FACTOR,
 } from '../src/lib/planner';
 import type { LegCombo, MotisItinerary, MotisLeg, MotisPlace, PlanResponse, TripOption, TripSettings } from '../src/lib/types';
 
@@ -545,7 +549,7 @@ describe('canReachStation', () => {
 
 describe('dropDominated', () => {
   const option = (id: string, start: string, end: string, transfers = 0) =>
-    ({ id, startTime: `2026-12-01T${start}:00Z`, endTime: `2026-12-01T${end}:00Z`, transfers }) as unknown as TripOption;
+    ({ id, startTime: `2026-12-01T${start}:00Z`, endTime: `2026-12-01T${end}:00Z`, transfers, legs: [] }) as unknown as TripOption;
 
   it('drops an option that leaves at about the same time and arrives clearly later', () => {
     const kept = dropDominated(
@@ -630,5 +634,50 @@ describe('pickCandidates spacing', () => {
     const stations = [stop('utc', 33.9, ['TRAM']), stop('executive', 33.905, ['TRAM']), stop('coaster', 33.902, ['REGIONAL_RAIL']), stop('nobel', 33.89, ['TRAM'])];
     const picked = pickCandidates(stations, [], torrance, santaMonica, 40, 3);
     expect(picked.map((c) => c.name).sort()).toEqual(['coaster', 'nobel', 'utc'].sort());
+  });
+});
+
+describe('rideshare cost and weighted offsets', () => {
+  const at = (minute: number) => `2026-12-01T18:${String(minute).padStart(2, '0')}:00Z`;
+  const option = (end: number, rideMin: number) =>
+    ({
+      startTime: at(0),
+      endTime: at(end),
+      transfers: 0,
+      legs: [
+        { mode: 'TRAM', durationSec: 900 },
+        { mode: 'RIDESHARE', durationSec: rideMin * 60 },
+      ],
+    }) as unknown as TripOption;
+
+  it('makes a longer rideshare earn its keep', () => {
+    expect(RIDESHARE_COST_FACTOR).toBe(1);
+    // Off at Clairemont with a 15-minute rideshare, or ride on downtown for a 5-minute one.
+    const clairemont = option(27, 15);
+    const downtown = option(33, 5);
+    expect(optionCost(false, downtown)).toBeLessThan(optionCost(false, clairemont));
+    // If riding on costs much more time, the longer rideshare wins after all.
+    expect(optionCost(false, option(45, 5))).toBeGreaterThan(optionCost(false, clairemont));
+  });
+
+  it('puts real times back on weighted first and last legs', () => {
+    const it: MotisItinerary = {
+      duration: 50 * 60,
+      startTime: at(0),
+      endTime: at(50),
+      transfers: 0,
+      legs: [
+        leg({ mode: 'CAR', from: place('START', torrance), to: place('A', expoBundy), startTime: at(0), endTime: at(20) }),
+        leg({ mode: 'TRAM', from: place('A', expoBundy), to: place('B', santaMonica), startTime: at(22), endTime: at(30) }),
+        leg({ mode: 'CAR', from: place('B', santaMonica), to: place('END', santaMonica), startTime: at(30), endTime: at(50) }),
+      ],
+    };
+    // The first leg carried 5 weighted minutes; the rideshare is really 12 minutes long.
+    const real = endWithLeg(startLater(it, 5 * 60), 12 * 60);
+    expect([real.startTime, real.endTime].map(Date.parse)).toEqual([at(5), at(42)].map(Date.parse));
+    expect(real.duration).toBe(37 * 60);
+    expect(real.legs[0].duration).toBe(15 * 60);
+    expect(real.legs[2].duration).toBe(12 * 60);
+    expect(it.endTime).toBe(at(50)); // the original is untouched
   });
 });

@@ -19,6 +19,8 @@ A drive-first search:
 4. Plans the transit part from **all the stations in one Transitous query**. Each station goes in as a possible start (`fromOffsets`), weighted by its drive time plus a parking buffer, so Transitous's own route search chooses between them. Transitous's own drive times ignore traffic, so these weights are what make the ranking reflect rush hour. If the answers use only one station, the app asks once more without it, so there's a comparison.
 5. Ranks the options by arrival time plus **5 minutes per transfer** (or by latest departure for "arrive by"), next to a drive-the-whole-way option. Another line has to save more than 5 minutes to win. An option is hidden if another leaves within 5 minutes of it and still comes out at least 15 minutes ahead.
 
+**Rideshare minutes count double** (they cost money): in the ranking, and in what Transitous optimizes, since each rideshare station goes into the query with its ride time counted twice. A longer rideshare has to save real time to be chosen, so the planner doesn't end a trip with a long rideshare just to save a few minutes. The times shown are always the real ones. "Arrive by" searches send real times, so you're not told to leave earlier than needed.
+
 When picking stations, the app skips one within 1 km of a station it already picked on the same kind of line (two neighbouring trolley stops, say), so the comparison covers more ground.
 
 Drives and rides longer than the "max" limits are dropped. If none fit, the shortest ones are kept and a note says so.
