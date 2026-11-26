@@ -1,6 +1,6 @@
 import type { Env } from './env';
 import { guardUpstream } from './ratelimit';
-import { fetchWithRetry, REJECTED_HEADER, type CacheOptions, type GateJob, type Service } from './upstream-common';
+import { fetchWithRetry, GATE_HEADER, REJECTED_HEADER, type CacheOptions, type GateJob, type Service } from './upstream-common';
 
 export interface UpstreamCall {
   service: Service;
@@ -60,9 +60,14 @@ export async function callUpstream(
     try {
       const gate = env.GATE.get(env.GATE.idFromName('global'));
       const response = await gate.fetch('https://gate/call', { method: 'POST', body: JSON.stringify(job) });
-      return { response, rejected: response.headers.get(REJECTED_HEADER) === '1', via: 'gate' };
+      if (response.headers.get(GATE_HEADER) === '1') {
+        return { response, rejected: response.headers.get(REJECTED_HEADER) === '1', via: 'gate' };
+      }
+      // Not from the gate: the platform answered for it (gate not deployed or not running).
+      await response.body?.cancel();
+      console.warn(`GATE unavailable (HTTP ${response.status}), using the D1 limiter instead`);
     } catch (err) {
-      // Gate not deployed or unreachable: fall back to the D1 limiter below.
+      // Gate unreachable: fall back to the D1 limiter below.
       console.warn('GATE unavailable, using the D1 limiter instead:', (err as Error).message);
     }
   }

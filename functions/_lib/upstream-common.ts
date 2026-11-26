@@ -44,6 +44,12 @@ export interface GateJob {
 /** Marks a response that came from the gate or limiter itself rather than from upstream. */
 export const REJECTED_HEADER = 'X-Limiter-Rejected';
 
+/**
+ * Set on every answer from the gate, so callers can tell it apart from the platform's own
+ * errors (such as "Worker not found" when the gate isn't deployed or running).
+ */
+export const GATE_HEADER = 'X-Gate';
+
 export function rejected(status: 429 | 503, error: string, retryAfterSec: number): Response {
   return json({ error }, status, { 'Retry-After': String(retryAfterSec), [REJECTED_HEADER]: '1' });
 }
@@ -76,6 +82,12 @@ export class GateCore {
   ) {}
 
   async handle(job: GateJob): Promise<Response> {
+    const res = await this.run(job);
+    res.headers.set(GATE_HEADER, '1');
+    return res;
+  }
+
+  private async run(job: GateJob): Promise<Response> {
     const now = this.now();
     const minute = Math.floor(now / 60_000);
     const seen = this.clients.get(job.client);

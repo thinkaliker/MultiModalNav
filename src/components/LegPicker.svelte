@@ -74,6 +74,10 @@
     <span>Max {onlyRideshareLast ? 'rideshare' : 'last leg'}: {settings.maxLastLegMin} min</span>
     <input type="range" min="5" max="45" step="5" bind:value={settings.maxLastLegMin} />
   </label>
+  <label>
+    <span>Min stops on transit: {settings.minTransitStops === 1 ? 'any' : settings.minTransitStops}</span>
+    <input type="range" min="1" max="8" step="1" bind:value={settings.minTransitStops} />
+  </label>
   {#if anyRideshare}
     <label>
       <span>Rideshare pickup wait: {settings.rideshareWaitMin} min</span>

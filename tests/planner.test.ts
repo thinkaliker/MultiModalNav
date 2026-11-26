@@ -12,6 +12,8 @@ import {
   estimateDrive,
   pickCandidates,
   scoreStation,
+  offsetsAvoiding,
+  transitStops,
 } from '../src/lib/planner';
 import type { LegCombo, MotisItinerary, MotisLeg, MotisPlace, PlanResponse, TripSettings } from '../src/lib/types';
 
@@ -51,6 +53,7 @@ const request: LegCombo = {
   parkBufferMin: 5,
   rideshareWaitMin: 6,
   stationsToCompare: 6,
+  minTransitStops: 3,
 };
 
 describe('scoreStation', () => {
@@ -334,6 +337,7 @@ describe('estimateCost', () => {
     parkBufferMin: 5,
     rideshareWaitMin: 6,
     stationsToCompare: 6,
+    minTransitStops: 3,
   };
 
   it('matches a plain park-and-ride search', () => {
@@ -343,10 +347,55 @@ describe('estimateCost', () => {
   });
 
   it('grows with each first/last combination', () => {
-    const cost = estimateCost({ ...base, firstLegs: ['CAR_PARKING', 'BIKE'], lastLegs: ['WALK', 'RIDESHARE'] }, true);
+    const combos = { ...base, firstLegs: ['CAR_PARKING', 'BIKE'], lastLegs: ['WALK', 'RIDESHARE'] } satisfies TripSettings;
     // Transitous: 1 discovery + 1 car mode x 2 last legs x 6 stations + 1 street mode x 2 last legs
     // TomTom: 6 + 1, then 4 rideshare stations, then 4 park-and-rideshare drives
-    expect(cost).toEqual({ tomtom: 15, transitous: 15 });
+    expect(estimateCost({ ...combos, minTransitStops: 1 }, true)).toEqual({ tomtom: 15, transitous: 15 });
+    // A minimum ride allows one retry per rideshare-last query: 6 stations + 1 bike query.
+    expect(estimateCost(combos, true)).toEqual({ tomtom: 15, transitous: 22 });
+  });
+});
+
+describe('minimum transit stops', () => {
+  const stop = (name: string, lat: number, extra: Partial<MotisPlace> = {}) =>
+    place(name, { lat, lon: -117.15 }, { stopId: name, ...extra });
+  const ride = (stops: number, exit: MotisPlace): MotisItinerary => {
+    const board = stop('board', 32.6);
+    const between = Array.from({ length: stops - 1 }, (_, i) => stop(`mid${i}`, 32.61 + i * 0.01));
+    return {
+      duration: 1800,
+      startTime: '2026-12-01T16:00:00Z',
+      endTime: '2026-12-01T16:30:00Z',
+      transfers: 0,
+      legs: [
+        leg({ mode: 'CAR', from: place('START', torrance), to: board, startTime: '2026-12-01T16:00:00Z', endTime: '2026-12-01T16:10:00Z' }),
+        leg({
+          mode: 'TRAM',
+          from: board,
+          to: exit,
+          intermediateStops: between,
+          startTime: '2026-12-01T16:10:00Z',
+          endTime: '2026-12-01T16:20:00Z',
+        }),
+        leg({ mode: 'CAR', from: exit, to: place('END', santaMonica), startTime: '2026-12-01T16:20:00Z', endTime: '2026-12-01T16:30:00Z' }),
+      ],
+    };
+  };
+
+  it('counts stops ridden on transit only', () => {
+    expect(transitStops(ride(1, stop('next', 32.61)))).toBe(1);
+    expect(transitStops(ride(4, stop('far', 32.7)))).toBe(4);
+  });
+
+  it('drops the rideshare stations that too-short trips got off at', () => {
+    const offsets = [
+      { stopId: 'next-parent', duration: 600, mode: 'CAR' as const },
+      { stopId: 'other', duration: 900, mode: 'CAR' as const },
+      { stopId: 'far', duration: 300, mode: 'CAR' as const },
+    ];
+    // Transitous reports the child stop; the offset was sent for its parent station.
+    const its = [ride(1, stop('next', 32.61, { parentId: 'next-parent' })), ride(2, stop('other', 32.62))];
+    expect(offsetsAvoiding(its, offsets).map((o) => o.stopId)).toEqual(['far']);
   });
 });
 

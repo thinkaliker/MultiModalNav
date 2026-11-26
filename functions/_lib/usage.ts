@@ -66,6 +66,11 @@ export function ensureSchema(db: UsageDb): Promise<unknown> {
         db.prepare(
           'CREATE TABLE IF NOT EXISTS rate (key TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (key, window_start))',
         ),
+        // Cached upstream responses (see cache.ts); expired rows are pruned now and then.
+        db.prepare(
+          'CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, expires INTEGER NOT NULL, content_type TEXT NOT NULL, body TEXT NOT NULL)',
+        ),
+        db.prepare('CREATE INDEX IF NOT EXISTS cache_expires ON cache (expires)'),
       ])
       .catch((err) => {
         schemas.delete(db);

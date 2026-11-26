@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fetchWithRetry, GateCore, REJECTED_HEADER, type GateJob, type UpstreamInit } from '../functions/_lib/upstream-common';
+import { fetchWithRetry, GATE_HEADER, GateCore, REJECTED_HEADER, type GateJob, type UpstreamInit } from '../functions/_lib/upstream-common';
 
 const job = (overrides: Partial<GateJob> = {}): GateJob => ({
   service: 'transitous',
@@ -90,6 +90,15 @@ describe('GateCore', () => {
     expect(failed.status).toBe(502);
     expect(failed.headers.get(REJECTED_HEADER)).toBeNull();
     expect((await gate.handle(job())).status).toBe(200);
+  });
+
+  it('marks every answer as coming from the gate', async () => {
+    const gate = new GateCore(async () => new Response('{}'));
+    const limits = { inFlight: 1, clientPerMinute: 1, maxWaitMs: 1000 };
+    const answered = await gate.handle(job({ limits }));
+    const refused = await gate.handle(job({ limits }));
+    expect([answered.status, refused.status]).toEqual([200, 429]);
+    expect([answered.headers.get(GATE_HEADER), refused.headers.get(GATE_HEADER)]).toEqual(['1', '1']);
   });
 });
 

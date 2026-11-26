@@ -1,9 +1,14 @@
+import { CACHE_HEADER, cachedResponse, openCache, storeCache } from '../../_lib/cache';
 import { json, type Env } from '../../_lib/env';
 import { callUpstream } from '../../_lib/upstream';
 import { limitFor, recordUse, undoUse } from '../../_lib/usage';
 
 // Traffic-aware car route via the TomTom Routing API. The API key never leaves the server.
 // GET /api/traffic/route?from=lat,lon&to=lat,lon[&departAt=ISO|now]
+
+// D1 cache lifetimes, in seconds.
+const LIVE_TTL = 300;
+const PREDICTED_TTL = 900;
 
 const COORD = /^-?\d{1,2}(\.\d+)?,-?\d{1,3}(\.\d+)?$/;
 
@@ -24,6 +29,12 @@ export const onRequestGet: PagesFunction<Env> = async ({ request, env, waitUntil
   const from = q.get('from');
   const to = q.get('to');
   if (!validCoord(from) || !validCoord(to)) return json({ error: 'from/to must be "lat,lon"' }, 400);
+  const departAt = q.get('departAt') ?? 'now';
+  if (departAt !== 'now' && !validTime(departAt)) return json({ error: 'bad departAt' }, 400);
+
+  // Cache hits don't call TomTom, so they don't count toward the monthly limit.
+  const cache = await openCache(env.USAGE_DB, 'tomtom', from, to, departAt);
+  if (cache?.hit) return cachedResponse(cache.hit, { 'Cache-Control': 'no-store' });
 
   if (env.USAGE_DB) {
     // A broken tracker shouldn't break routing, so fail open.
@@ -39,8 +50,6 @@ export const onRequestGet: PagesFunction<Env> = async ({ request, env, waitUntil
     computeTravelTimeFor: 'all',
     routeRepresentation: 'polyline',
   });
-  const departAt = q.get('departAt') ?? 'now';
-  if (departAt !== 'now' && !validTime(departAt)) return json({ error: 'bad departAt' }, 400);
   params.set('departAt', departAt);
 
   const { response: upstream, rejected, via } = await callUpstream(
@@ -65,8 +74,10 @@ export const onRequestGet: PagesFunction<Env> = async ({ request, env, waitUntil
       'X-Upstream-Via': via,
     });
   }
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Upstream-Via': via },
-  });
+  const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Upstream-Via': via };
+  if (!cache) return new Response(upstream.body, { headers });
+  const text = await upstream.text();
+  // Live traffic goes stale within minutes; predictions for a later departure much less so.
+  storeCache(cache, { body: text, contentType: 'application/json' }, departAt === 'now' ? LIVE_TTL : PREDICTED_TTL, waitUntil);
+  return new Response(text, { headers: { ...headers, [CACHE_HEADER]: 'MISS' } });
 };

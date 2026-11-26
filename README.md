@@ -23,13 +23,15 @@ Drives and rides longer than the "max" limits are dropped. If none fit, the shor
 
 A **rideshare last leg** works the same way from the other end. The app finds up to 4 stations near the destination and gets a traffic-aware ride time from each. It adds the pickup wait and passes the totals to Transitous as the last leg (`toOffsets`), so Transitous picks the best station to get off at. Transitous can't route a car last leg itself.
 
+**Minimum stops on transit** (under Limits, default 3) drops trips that ride fewer stops, counting all transit legs together. Without it, a rideshare last leg can produce "drive to a station, ride one stop, rideshare the rest", which is only "fastest" on paper. When every trip Transitous returns for a station is too short and the last leg is a rideshare, the app asks once more without the stations those trips got off at, so the next-best station further down the line gets a chance. Set it to "any" to turn this off.
+
 Walk-first and bike-first searches are a single Transitous query (plus the rideshare lookups if the last leg is a rideshare).
 
 With several modes selected, each first/last pairing is planned separately, because one combined query would only return the fastest mode. TomTom lookups, Transitous's park-and-ride pick and the rideshare stations are shared between pairings. Queries are kept to 3 at a time for Transitous and 2 for TomTom, and the server retries their "too many requests" responses.
 
 **No-transit comparisons** appear under "For comparison": driving or rideshare the whole way, walking or biking the whole way, and, when both "Drive & park" and "Rideshare" are selected, **park near the destination and rideshare the rest**. That last one parks at a station lot near the destination (from the rideshare search) and doesn't count against the max-drive limit.
 
-**Free tier use per drive-first search** (default 6 stations): about 7 TomTom routes (11 with a rideshare last leg) and 7 Transitous queries, plus station lists, which are cached for a week. Each extra first/last pairing adds up to 6 Transitous queries for a car first leg, or 1 for walk or bike. The app shows an estimate under **Find routes** before you search. TomTom's free 20,000 routes a month works out to roughly 1,800 to 2,800 single-mode searches. Transitous asks to be contacted above about 720 plan queries a day, which is roughly 100 searches.
+**Free tier use per drive-first search** (default 6 stations): about 7 TomTom routes (11 with a rideshare last leg) and 7 Transitous queries, plus station lists, which are cached for a week. A rideshare last leg can add one retry query per station (see minimum stops above). Repeating a search within a few minutes is mostly answered from the cache (below). Each extra first/last pairing adds up to 6 Transitous queries for a car first leg, or 1 for walk or bike. The app shows an estimate under **Find routes** before you search. TomTom's free 20,000 routes a month works out to roughly 1,800 to 2,800 single-mode searches. Transitous asks to be contacted above about 720 plan queries a day, which is roughly 100 searches.
 
 ### Usage tracking and rate limits
 
@@ -51,11 +53,26 @@ The server also limits upstream calls across **all** connected clients, so sever
 
 - Station-list tiles skip these limits. They come in a burst at the start of a search and are mostly served from Cloudflare's cache.
 - Each API response carries an `X-Upstream-Via` header (`gate`, `limiter` or `direct`), so you can check in the browser's dev tools which path was used.
-- If the queue or the database fails, requests go ahead rather than failing. Gate failures are logged as `GATE unavailable` in the Pages Functions logs.
-- Usage counters (the footer) live in the optional `USAGE_DB` database (see setup below). Without it, nothing is counted, the monthly TomTom stop is off, and the fallback limiter is off too. The queue doesn't need it.
+- If the queue or the database fails, requests go ahead rather than failing. Gate failures are logged as `GATE unavailable` in the Pages Functions logs. The gate marks its own answers with `X-Gate: 1`; anything else that comes back through the binding (such as "Worker not found" when it isn't deployed or running) is treated as unavailable.
+- Usage counters (the footer) live in the optional `USAGE_DB` database (see setup below). Without it, nothing is counted or cached, the monthly TomTom stop is off, and the fallback limiter is off too. The queue doesn't need it.
 - Counts only include this app's calls, and periods are UTC months and days. TomTom's own dashboard is the authoritative figure.
 - Devices are told apart by IP address (`CF-Connecting-IP`), so people on the same network share a per-device budget. A heavy multi-mode search makes about 60 upstream calls.
 - Each browser tab also keeps itself to 3 Transitous and 2 TomTom requests at a time.
+
+### Caching
+
+With the `USAGE_DB` database, the server keeps successful answers in a `cache` table and serves repeats from there, for every client. Cache hits don't call TomTom or Transitous, so they don't count toward the usage limits, the rate limits or the queue.
+
+| Request | Kept for | Why |
+| --- | --- | --- |
+| TomTom drive, leaving now | 5 minutes | Live traffic goes stale quickly |
+| TomTom drive, leaving later | 15 minutes | Predicted traffic changes slowly |
+| Transitous trip plan | 2 minutes | Real-time delays and cancellations |
+| Transitous place search | 1 day | Places rarely change |
+
+- A cached answer has to match the request exactly: same places, same time and same options. "Leave now" searches are pinned to the whole minute, so searching again soon after (say, with another leg mode turned on) reuses everything the two searches share. TomTom "leave now" lookups match for the full 5 minutes.
+- Each set of results says how many answers came from the cache, and every cached API response has an `X-Cache: HIT` header (`MISS` when it was fetched and stored).
+- Expired rows are deleted every so often, and answers over 500 KB aren't stored (D1 rows max out at 2 MB). Cloudflare's edge cache still covers station tiles, which the browser also keeps for a week.
 
 ## Setup
 
@@ -80,7 +97,7 @@ npm run check    # type-check the app and the Functions
 
 ### 3. Usage database (`USAGE_DB`, optional but recommended)
 
-This is a free [D1](https://developers.cloudflare.com/d1/) database that turns on usage tracking, the TomTom monthly stop, and the shared rate limits. The free tier (100,000 writes a day) is plenty: each upstream call costs about 3 writes. Because `wrangler.toml` is the source of truth for this project, the binding has to go in that file; the dashboard's Bindings page will be read-only. The database id is just an identifier, not a secret, so it's fine to commit.
+This is a free [D1](https://developers.cloudflare.com/d1/) database that turns on usage tracking, the TomTom monthly stop, the shared rate limits, and the response cache. The free tier (100,000 writes a day, 5 GB) is plenty: each upstream call costs about 4 writes, and cached answers are deleted soon after they expire. Because `wrangler.toml` is the source of truth for this project, the binding has to go in that file; the dashboard's Bindings page will be read-only. The database id is just an identifier, not a secret, so it's fine to commit.
 
 **Option A: from the command line** (on your own machine)
 
@@ -111,6 +128,7 @@ database_id = "…"
 2. Check it: sign in, and the footer should read "Usage: TomTom 0 / 20,000 routes this month · …" instead of "Usage tracking is off". To look at the raw counters:
    ```sh
    npx wrangler d1 execute multimodalnav-usage --remote --command "SELECT * FROM usage"
+   npx wrangler d1 execute multimodalnav-usage --remote --command "SELECT COUNT(*), SUM(LENGTH(body)) FROM cache"
    ```
 3. To change any limit, edit its value under `[vars]` in `wrangler.toml` and push.
 
@@ -180,7 +198,7 @@ npm run deploy
 | `TOMTOM_MAX_IN_FLIGHT` | no (in `wrangler.toml`) | TomTom requests running at once, all clients, with the queue; default 2 |
 | `TRANSITOUS_MAX_IN_FLIGHT` | no (in `wrangler.toml`) | Transitous requests running at once, all clients, with the queue; default 3 |
 | `CLIENT_MAX_PER_MINUTE` | no (in `wrangler.toml`) | Upstream requests per minute from one device; default 120 |
-| `USAGE_DB` | recommended (D1 binding) | Turns on usage tracking, the TomTom monthly stop and the fallback limiter |
+| `USAGE_DB` | recommended (D1 binding) | Turns on usage tracking, the TomTom monthly stop, the fallback limiter and the response cache |
 | `GATE` | recommended (Durable Object binding) | The request queue from `gate/`; see step 4 |
 
 The first three are **secrets**: set them in the dashboard or with `wrangler pages secret put`, and never put them in `wrangler.toml`, which is public.

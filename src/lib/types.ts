@@ -114,10 +114,15 @@ export interface UsageReport {
   'transitous.plan'?: UsageMeter;
 }
 
-/** Upstream calls made by one search. */
-export interface SearchUsage {
+/** Upstream calls made (or estimated) for one search. */
+export interface UpstreamCounts {
   tomtom: number;
   transitous: number;
+}
+
+export interface SearchUsage extends UpstreamCounts {
+  /** Answers served from the server's cache, which cost neither service anything. */
+  cached: number;
 }
 
 // App model.
@@ -143,6 +148,8 @@ export interface TripSettings {
   parkBufferMin: number;
   rideshareWaitMin: number;
   stationsToCompare: number;
+  /** Trips riding fewer stops than this (all transit legs together) are dropped. */
+  minTransitStops: number;
 }
 
 export interface TripRequest extends TripSettings {

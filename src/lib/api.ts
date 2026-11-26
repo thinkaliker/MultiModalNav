@@ -26,7 +26,17 @@ export class ApiError extends Error {
   }
 }
 
+/** An upstream answer, and whether the server's shared cache supplied it. */
+export interface Fetched<T> {
+  data: T;
+  cached: boolean;
+}
+
 async function request<T>(url: string, init: RequestInit = {}): Promise<T> {
+  return (await fetched<T>(url, init)).data;
+}
+
+async function fetched<T>(url: string, init: RequestInit = {}): Promise<Fetched<T>> {
   const res = await fetch(url, { credentials: 'same-origin', ...init });
   if (res.status === 401) throw new AuthError();
   if (!res.ok) {
@@ -41,7 +51,7 @@ async function request<T>(url: string, init: RequestInit = {}): Promise<T> {
     }
     throw new ApiError(res.status, message, upstreamStatus);
   }
-  return res.json() as Promise<T>;
+  return { data: (await res.json()) as T, cached: res.headers.get('X-Cache') === 'HIT' };
 }
 
 const qs = (params: Record<string, string | number | boolean | undefined>) => {
@@ -85,7 +95,7 @@ export const api = {
     ),
 
   plan: (params: PlanParams, signal?: AbortSignal) =>
-    request<PlanResponse>(`/api/transit/v6/plan?${qs(params)}`, { signal }),
+    fetched<PlanResponse>(`/api/transit/v6/plan?${qs(params)}`, { signal }),
 
   /** Plan with client-computed first and/or last miles, which replace Transitous's own. */
   planWithOffsets: (
@@ -93,7 +103,7 @@ export const api = {
     offsets: { fromOffsets?: PlanOffset[]; toOffsets?: PlanOffset[] },
     signal?: AbortSignal,
   ) =>
-    request<PlanResponse>(`/api/transit/v6/plan?${qs(params)}`, {
+    fetched<PlanResponse>(`/api/transit/v6/plan?${qs(params)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(offsets),
@@ -101,7 +111,7 @@ export const api = {
     }),
 
   trafficRoute: (from: LatLon, to: LatLon, timing: DriveTiming, signal?: AbortSignal) =>
-    request<TomTomRouteResponse>(
+    fetched<TomTomRouteResponse>(
       `/api/traffic/route?${qs({ from: fmtLatLon(from), to: fmtLatLon(to), ...timing })}`,
       { signal },
     ),

@@ -19,6 +19,7 @@ import type {
   TripOption,
   TripRequest,
   TripSettings,
+  UpstreamCounts,
 } from './types';
 
 // Rough speeds used only to pre-rank candidate stations and as a fallback without traffic data.
@@ -204,6 +205,23 @@ export function withinLimit(drives: Drive[], limitSec: number, fallback = 1): { 
     .slice(0, fallback)
     .map(([, i]) => i);
   return { keep: shortest, relaxed: true };
+}
+
+/** Stops ridden on transit, over all of an itinerary's transit legs. */
+export function transitStops(it: MotisItinerary): number {
+  return it.legs.reduce((n, l) => n + (STREET_MODES.has(l.mode) ? 0 : (l.intermediateStops?.length ?? 0) + 1), 0);
+}
+
+/** The `toOffsets` stations other than the ones where `its` get off transit. */
+export function offsetsAvoiding(its: MotisItinerary[], offsets: PlanOffset[]): PlanOffset[] {
+  const exits = new Set<string>();
+  for (const it of its) {
+    // With toOffsets, the last leg is the injected one, starting where the trip leaves transit.
+    const exit = it.legs[it.legs.length - 1]?.from;
+    if (exit?.stopId) exits.add(exit.stopId);
+    if (exit?.parentId) exits.add(exit.parentId);
+  }
+  return offsets.filter((o) => !exits.has(o.stopId));
 }
 
 /** TomTom wants an RFC 3339 time in the future, or "now". */
@@ -579,7 +597,7 @@ interface PlanContext extends PlanOptions {
   discovery(req: LegCombo, mode: string): Promise<PlanResponse | null>;
   /** Rideshare options from stations near the destination, computed once. */
   lastMile(): Promise<LastMile | undefined>;
-  stats: { tried: number; missing: number };
+  stats: { tried: number; missing: number; tooShort: number };
 }
 
 type Limiter = <T>(task: () => Promise<T>) => Promise<T>;
@@ -604,12 +622,50 @@ function makeLimiter(limit: number): Limiter {
 // Transitous answers bursts with HTTP 429, so keep a search's queries to a few at a time.
 const TRANSITOUS_CONCURRENCY = 3;
 
+type Offsets = Parameters<typeof api.planWithOffsets>[1];
+
 /** Transitous plan queries, counted toward this search's usage. */
-function planQuery(ctx: PlanContext, params: PlanParams, offsets?: Parameters<typeof api.planWithOffsets>[1]) {
-  return ctx.transitousSlot(() => {
-    ctx.usage.transitous++;
-    return offsets ? api.planWithOffsets(params, offsets, ctx.signal) : api.plan(params, ctx.signal);
+function planQuery(ctx: PlanContext, params: PlanParams, offsets?: Offsets): Promise<PlanResponse> {
+  return ctx.transitousSlot(async () => {
+    try {
+      const { data, cached } = offsets
+        ? await api.planWithOffsets(params, offsets, ctx.signal)
+        : await api.plan(params, ctx.signal);
+      ctx.usage[cached ? 'cached' : 'transitous']++;
+      return data;
+    } catch (err) {
+      ctx.usage.transitous++;
+      throw err;
+    }
   });
+}
+
+/**
+ * A plan query keeping only trips that ride at least `minTransitStops` stops. If Transitous's
+ * picks all ride fewer and the last mile is a rideshare, ask once more without the stations
+ * those trips got off at: the next-best is usually further down the line. `tooShort` says
+ * there were trips, but none rode far enough.
+ */
+async function planTransit(
+  ctx: PlanContext,
+  req: LegCombo,
+  params: PlanParams,
+  offsets?: Offsets,
+): Promise<{ plan: PlanResponse; tooShort: boolean }> {
+  const plan = await planQuery(ctx, params, offsets);
+  if (req.minTransitStops <= 1 || !plan.itineraries.length) return { plan, tooShort: false };
+  const longEnough = (p: PlanResponse): PlanResponse => ({
+    ...p,
+    itineraries: p.itineraries.filter((it) => transitStops(it) >= req.minTransitStops),
+  });
+  let kept = longEnough(plan);
+  if (!kept.itineraries.length && offsets?.toOffsets) {
+    const toOffsets = offsetsAvoiding(plan.itineraries, offsets.toOffsets);
+    if (toOffsets.length && toOffsets.length < offsets.toOffsets.length) {
+      kept = longEnough(await planQuery(ctx, params, { ...offsets, toOffsets }));
+    }
+  }
+  return { plan: kept, tooShort: !kept.itineraries.length };
 }
 
 function rethrowIfFatal(err: unknown, signal?: AbortSignal) {
@@ -635,8 +691,8 @@ function makeDriver({ trafficEnabled, signal, usage }: PlanOptions & { usage: Se
   async function lookup(from: LatLon, to: LatLon, timing: DriveTiming): Promise<Drive> {
     try {
       if (disabled) return estimateDrive(from, to);
-      const res = await api.trafficRoute(from, to, timing, signal);
-      usage.tomtom++;
+      const { data: res, cached } = await api.trafficRoute(from, to, timing, signal);
+      usage[cached ? 'cached' : 'tomtom']++;
       if (res.routes?.length) return driveFromTomTom(res);
     } catch (err) {
       rethrowIfFatal(err, signal);
@@ -728,13 +784,15 @@ async function prepareRideshareLastMile(
 }
 
 /** Upper-bound estimate of the upstream calls a search with these settings makes. */
-export function estimateCost(s: TripSettings, trafficEnabled: boolean): SearchUsage {
+export function estimateCost(s: TripSettings, trafficEnabled: boolean): UpstreamCounts {
   const car = s.firstLegs.filter(isCarFirst);
   const street = s.firstLegs.length - car.length;
   const discoveries = new Set(car.map((m) => (m === 'CAR_PARKING' ? 'CAR_PARKING' : 'CAR_DROPOFF'))).size;
   const rideshareLast = s.lastLegs.includes('RIDESHARE');
   const rideshareStations = Math.min(s.stationsToCompare, MAX_RIDESHARE_STATIONS);
-  const transitous = discoveries + car.length * s.lastLegs.length * s.stationsToCompare + street * s.lastLegs.length;
+  // With a minimum ride, a rideshare last mile may need a second query (see planTransit).
+  const retries = rideshareLast && s.minTransitStops > 1 ? car.length * s.stationsToCompare + street : 0;
+  const transitous = discoveries + car.length * s.lastLegs.length * s.stationsToCompare + street * s.lastLegs.length + retries;
   let tomtom = 0;
   if (trafficEnabled) {
     if (car.length) tomtom += s.stationsToCompare + discoveries; // station drives + drive the whole way
@@ -746,8 +804,11 @@ export function estimateCost(s: TripSettings, trafficEnabled: boolean): SearchUs
 
 const MAX_OPTIONS = 15;
 
-export async function planTrip(req: TripRequest, opts: PlanOptions): Promise<PlanResult> {
-  const usage: SearchUsage = { tomtom: 0, transitous: 0 };
+export async function planTrip(search: TripRequest, opts: PlanOptions): Promise<PlanResult> {
+  // Pin "now" to the whole minute, so this search's queries (and a repeat of it shortly after)
+  // ask the same questions and can be answered from the server's cache.
+  const req: TripRequest = { ...search, time: search.time ?? new Date(Math.floor(Date.now() / 60_000) * 60_000) };
+  const usage: SearchUsage = { tomtom: 0, transitous: 0, cached: 0 };
   const notes: string[] = [];
   const driver = makeDriver({ ...opts, usage });
   const discoveries = new Map<string, Promise<PlanResponse | null>>();
@@ -758,7 +819,7 @@ export async function planTrip(req: TripRequest, opts: PlanOptions): Promise<Pla
     transitousSlot: makeLimiter(TRANSITOUS_CONCURRENCY),
     notes,
     driver,
-    stats: { tried: 0, missing: 0 },
+    stats: { tried: 0, missing: 0, tooShort: 0 },
     discovery(combo, mode) {
       let pending = discoveries.get(mode);
       if (!pending) {
@@ -795,6 +856,10 @@ export async function planTrip(req: TripRequest, opts: PlanOptions): Promise<Pla
   if (ctx.stats.missing) {
     notes.push(`${ctx.stats.missing} of ${ctx.stats.tried} station options had no connection in the search window.`);
   }
+  if (ctx.stats.tooShort) {
+    const n = ctx.stats.tooShort;
+    notes.push(`Hid ${n} option${n > 1 ? 's' : ''} riding fewer than ${req.minTransitStops} stops on transit (see Limits).`);
+  }
   if (all.length > MAX_OPTIONS) notes.push(`Showing the ${MAX_OPTIONS} best of ${all.length} options.`);
   if (!all.length) notes.push('No transit connections found. Try more transit modes or a longer first/last leg.');
   return { options, direct, notes: [...new Set(notes)], usage };
@@ -812,9 +877,11 @@ async function planStreetFirst(req: LegCombo, ctx: PlanContext): Promise<ComboRe
   const lastMile = req.lastLeg === 'RIDESHARE' ? await ctx.lastMile() : undefined;
   if (req.lastLeg === 'RIDESHARE' && !lastMile) return { options: [], direct: [] };
   let res: PlanResponse;
+  let tooShort: boolean;
   try {
-    res = await planQuery(
+    ({ plan: res, tooShort } = await planTransit(
       ctx,
+      req,
       {
         ...baseParams(req),
         preTransitModes: req.firstLeg,
@@ -822,14 +889,15 @@ async function planStreetFirst(req: LegCombo, ctx: PlanContext): Promise<ComboRe
         directModes: req.firstLeg,
       },
       lastMile ? { toOffsets: lastMile.offsets } : undefined,
-    );
+    ));
   } catch (err) {
     rethrowIfFatal(err, ctx.signal);
     ctx.notes.push(`Couldn’t plan ${req.firstLeg.toLowerCase()} → ${req.lastLeg.toLowerCase()} trips (${(err as Error).message}).`);
     return { options: [], direct: [] };
   }
   const prefix = `transit:${req.firstLeg}:${req.lastLeg}`;
-  if (!res.itineraries.length) {
+  if (tooShort) ctx.stats.tooShort++;
+  else if (!res.itineraries.length) {
     ctx.notes.push(
       `No ${req.firstLeg.toLowerCase()} → transit → ${req.lastLeg.toLowerCase()} trips within your limits; try a longer first or last leg, or more transit modes.`,
     );
@@ -886,22 +954,24 @@ async function planCarFirst(req: LegCombo, ctx: PlanContext): Promise<ComboResul
   const bufferSec = firstLegBufferSec(req);
   const options = await mapLimit(candidates, 3, async (c, i) => {
     const offsetSec = drives[i].seconds + bufferSec + c.walkSec;
+    let option: TripOption | null = null;
     try {
-      const plan = await planQuery(ctx, base, {
+      const { plan, tooShort } = await planTransit(ctx, req, base, {
         fromOffsets: [{ stopId: c.stopId, duration: offsetSec, mode: 'CAR' }],
         toOffsets: lastMile?.offsets,
       });
-      return buildParkRideOption(req, c, drives[i], offsetSec, plan, lastMile);
+      if (tooShort) ctx.stats.tooShort++;
+      option = buildParkRideOption(req, c, drives[i], offsetSec, plan, lastMile);
+      if (!option && !tooShort) ctx.stats.missing++;
     } catch (err) {
       rethrowIfFatal(err, signal);
-      return null;
+      ctx.stats.missing++;
     }
+    return option;
   });
 
-  const found = options.filter((o): o is TripOption => o !== null);
   ctx.stats.tried += candidates.length;
-  ctx.stats.missing += candidates.length - found.length;
-  return { options: found, direct };
+  return { options: options.filter((o): o is TripOption => o !== null), direct };
 }
 
 /**

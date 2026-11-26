@@ -22,6 +22,7 @@
     parkBufferMin: 5,
     rideshareWaitMin: 6,
     stationsToCompare: 6,
+    minTransitStops: 3,
   };
 
   let auth = $state<'checking' | 'signed-out' | 'signed-in'>('checking');
@@ -213,7 +214,8 @@
         {#each result.notes as note}<p class="note">{note}</p>{/each}
         <p class="cost">
           This search used {result.usage.tomtom} TomTom route{result.usage.tomtom === 1 ? '' : 's'} and
-          {result.usage.transitous} Transitous quer{result.usage.transitous === 1 ? 'y' : 'ies'}.
+          {result.usage.transitous} Transitous quer{result.usage.transitous === 1 ? 'y' : 'ies'}{#if result.usage.cached}
+            , plus {result.usage.cached} answer{result.usage.cached === 1 ? '' : 's'} from the cache{/if}.
         </p>
         <ResultsList
           options={result.options}
