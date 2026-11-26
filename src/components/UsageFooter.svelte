@@ -13,15 +13,13 @@
   </span>
 {/snippet}
 
-{#if report}
+{#if report?.tracking && report['tomtom.route'] && report['transitous.plan']}
   <p class="usage">
-    {#if report.tracking && report['tomtom.route'] && report['transitous.plan']}
-      Usage: {@render meter('TomTom', 'routes', report['tomtom.route'])} ·
-      {@render meter('Transitous', 'queries', report['transitous.plan'])}
-    {:else}
-      Usage tracking is off (no USAGE_DB database bound).
-    {/if}
+    Usage: {@render meter('TomTom', 'routes', report['tomtom.route'])} ·
+    {@render meter('Transitous', 'queries', report['transitous.plan'])}
   </p>
+{:else if report?.tracking === false}
+  <p class="usage">Usage tracking is off (no USAGE_DB database bound).</p>
 {/if}
 
 <style>

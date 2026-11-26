@@ -6,6 +6,8 @@ export const onRequestGet: PagesFunction<Env> = async ({ env }) => {
   try {
     return json({ tracking: true, ...(await readUsage(env.USAGE_DB, env)) });
   } catch (err) {
-    return json({ tracking: false, error: String(err) });
+    // A failed read, not a missing database: the page keeps showing the last numbers.
+    console.error('Usage read failed:', String(err));
+    return json({ error: 'Could not read usage' }, 503);
   }
 };

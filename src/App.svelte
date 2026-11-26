@@ -72,7 +72,7 @@
     try {
       usage = await api.usage();
     } catch {
-      usage = null;
+      // keep the last numbers; they're only a little out of date
     }
   }
 

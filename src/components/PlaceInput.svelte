@@ -119,7 +119,8 @@
   </div>
   {#if open && suggestions.length}
     <ul class="suggestions">
-      {#each suggestions as match (match.id)}
+      <!-- Not keyed by id: Transitous gives street addresses an empty one. -->
+      {#each suggestions as match}
         <li>
           <button type="button" onpointerdown={(e) => { e.preventDefault(); choose(match); }}>
             <span>{match.houseNumber && match.street ? `${match.houseNumber} ${match.street}` : match.name}</span>
